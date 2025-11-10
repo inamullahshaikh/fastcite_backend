@@ -43,5 +43,5 @@ htmlcov/
 /src/qdrant_storage/
 /src/pdfs/
 /src/logs/
-/src/logs/
+/src/downloads/
 /src/uploads/
