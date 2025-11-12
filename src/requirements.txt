@@ -1,0 +1,15 @@
+authlib==1.6.5
+b2sdk==2.10.1
+celery==5.5.3
+fastapi==0.121.1
+fitz==0.0.1.dev2
+motor==3.7.1
+passlib==1.7.4
+protobuf==6.33.0
+pydantic==2.12.4
+pymongo==4.15.3
+python-dotenv==1.2.1
+python_jose==3.5.0
+qdrant_client==1.15.1
+sentence_transformers==5.1.2
+starlette==0.50.0

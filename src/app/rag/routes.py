@@ -1,11 +1,7 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends
 from celery_app.tasks import search_similar_in_books_task, process_contexts_and_generate_task
 from app.helpers import AIMODEL, B2_UPLOADER
 import os
-import uuid
-import shutil
-from celery_app.celery_app import celery_app
-from celery.result import AsyncResult
 from pydantic import BaseModel
 from database.mongo import books_collection, chat_sessions_collection
 from database.auth import get_current_user

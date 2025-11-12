@@ -1,42 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import EmailStr
+from pydantic import BaseModel, EmailStr
 from typing import List, Optional, Literal
-from uuid import uuid4, UUID
+from uuid import UUID
 from datetime import datetime, date
 from database.auth import get_current_user, users_collection
-
-from pydantic import BaseModel, Field
-
+from database.models import User
 router = APIRouter(prefix="/users", tags=["Users"])
 
-class UserProfile(BaseModel):
-    id: UUID
-    username: str
-    name: str
-    dob: Optional[str] = None  # return ISO string for frontend
-    email: EmailStr
-    role: Literal["user", "admin"] = "user"
-
-    class Config:
-        from_attributes = True  # for Pydantic v2
-        json_schema_extra = {
-            "example": {
-                "id": "3906100a-c589-4a10-be1a-c6d230533bf2",
-                "username": "inam123",
-                "name": "Inam Ullah",
-                "dob": "2004-06-17",
-                "email": "inam@example.com",
-                "role": "user"
-            }
-        }
 # ----------------------------
-# USER PROFILE MODEL
+# USER PROFILE MODEL (for frontend)
 # ----------------------------
 class UserProfile(BaseModel):
     id: UUID
     username: str
     name: str
-    dob: Optional[str] = None  # ISO string for frontend
+    dob: Optional[str] = None  # ISO string
     email: EmailStr
     role: Literal["user", "admin"] = "user"
 
@@ -54,19 +32,7 @@ class UserProfile(BaseModel):
         }
 
 # ----------------------------
-# USER MODEL
-# ----------------------------
-class User(BaseModel):
-    id: UUID = Field(default_factory=uuid4)
-    username: str
-    pass_hash: str
-    name: str
-    dob: Optional[date] = None
-    email: EmailStr
-    role: Literal["user", "admin"] = "user"
-
-# ----------------------------
-# CREATE USER (anyone)
+# CREATE USER (public)
 # ----------------------------
 @router.post("/", status_code=201)
 async def create_user(user: User):
@@ -75,6 +41,7 @@ async def create_user(user: User):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     data = user.dict()
+    data["id"] = str(data["id"])  # ensure stored as string
     data["created_at"] = datetime.utcnow()
     await users_collection.insert_one(data)
     return {"message": "User created successfully"}
@@ -84,7 +51,7 @@ async def create_user(user: User):
 # ----------------------------
 @router.get("/", response_model=List[User])
 async def get_all_users(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != "admin":
+    if str(current_user.get("role")) != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     cursor = users_collection.find({}, {"_id": 0})
@@ -100,8 +67,10 @@ async def get_user_by_id(user_id: str, current_user: dict = Depends(get_current_
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if current_user["role"] != "admin" and str(current_user["id"]) != user_id:
+    # allow access if admin or self
+    if str(current_user["id"]) != str(user_id) and str(current_user.get("role")) != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
+
     return user
 
 # ----------------------------
@@ -110,11 +79,8 @@ async def get_user_by_id(user_id: str, current_user: dict = Depends(get_current_
 @router.get("/getmyprofile/me", response_model=UserProfile)
 async def get_my_profile(current_user: dict = Depends(get_current_user)):
     dob_value = current_user.get("dob")
-    # Ensure dob is string for frontend
-    if isinstance(dob_value, (datetime, date)):
-        dob = dob_value.isoformat()
-    else:
-        dob = dob_value
+    dob = dob_value.isoformat() if isinstance(dob_value, (datetime, date)) else dob_value
+
     return {
         "id": str(current_user.get("id") or current_user.get("_id")),
         "username": current_user.get("username"),
@@ -132,11 +98,15 @@ async def update_user(user_id: str, updates: dict, current_user: dict = Depends(
     user = await users_collection.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if current_user["role"] != "admin" and str(current_user["id"]) != user_id:
+
+    if str(current_user["id"]) != str(user_id) and str(current_user.get("role")) != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
 
-    protected = {"id", "email", "role"}
-    updates = {k: v for k, v in updates.items() if k not in protected}
+    protected_fields = {"id", "email", "role"}
+    updates = {k: v for k, v in updates.items() if k not in protected_fields}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
     await users_collection.update_one({"id": user_id}, {"$set": updates})
     return {"message": "User updated successfully"}
 
@@ -148,7 +118,8 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     user = await users_collection.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if current_user["role"] != "admin" and str(current_user["id"]) != user_id:
+
+    if str(current_user["id"]) != str(user_id) and str(current_user.get("role")) != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
 
     await users_collection.delete_one({"id": user_id})

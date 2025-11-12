@@ -64,7 +64,7 @@ class ChatMessage(BaseModel):
 # ============================
 class ChatSession(BaseModel):
     id: UUID = Field(default_factory=uuid4)
-    user_id: UUID
+    user_id: Optional[str] = ""
     title: Optional[str] = Field(default="New Chat")
     messages: List[ChatMessage] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)

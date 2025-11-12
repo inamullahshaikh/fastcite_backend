@@ -2,10 +2,8 @@ import os
 import uuid
 import fitz
 import concurrent.futures
-from typing import List, Tuple, Dict
-from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient, models
-from b2sdk.v2 import InMemoryAccountInfo, B2Api
+from typing import List, Dict
+from qdrant_client import models
 from celery_app.celery_app import celery_app
 from database.mongo import books_collections as books_collection
 from datetime import datetime
