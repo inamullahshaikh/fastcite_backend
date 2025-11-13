@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 import os
-
+from pathlib import Path
 from database.auth import router as auth_router
 from database.api.user import router as user_router
 from database.auth import router as auth_router
@@ -11,8 +11,14 @@ from database.api.chat import router as chat_router
 from database.api.book import router as book_router
 from app.books.routes import router as app_book_router
 from app.rag.routes import router as rag_router
+from fastapi.staticfiles import StaticFiles
+
 app = FastAPI(title="AI Project API", version="1.0")
 
+
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOADS_DIR = BASE_DIR / "downloads"
+app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 # ✅ Allow frontend (Vite) to access backend API
 origins = [
     "http://localhost:5173",   # Vite dev server

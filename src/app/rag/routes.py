@@ -25,7 +25,7 @@ async def book_exists(book_id: str) -> bool:
     book = await books_collection.find_one({"id": book_id})
     return book is not None
 
-FILE_SERVER_URL = os.getenv("FILE_SERVER_URL", "http://localhost:8000/files")
+FILE_SERVER_URL = os.getenv("FILE_SERVER_URL", "http://localhost:8000")
 
 @router.post("/query")
 async def rag_multiple_books_answer(
@@ -112,13 +112,13 @@ async def rag_multiple_books_answer(
                 local_pdf_path = Path(local_pdf)
 
                 # Create relative URL path
-                relative_path = f"pdfs/{local_pdf_path.name}" if "pdfs" in str(local_pdf_path) else local_pdf_path.name
+                relative_path = f"downloads/{local_pdf_path.name}"
                 url = f"{FILE_SERVER_URL}/{quote(relative_path.replace(os.sep, '/'))}"
-
                 downloaded_files.append({
                     "type": "pdf",
                     "path": str(local_pdf),
-                    "url": url
+                    "url": url,
+                    "name": c["path"]
                 })
             except Exception as e:
                 print(f"Error downloading PDF {source_pdf}: {e}")
