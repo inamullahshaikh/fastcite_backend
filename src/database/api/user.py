@@ -3,7 +3,7 @@ from pydantic import BaseModel, EmailStr
 from typing import List, Optional, Literal
 from uuid import UUID
 from datetime import datetime, date
-from database.auth import get_current_user, users_collection
+from database.auth import get_current_user, users_collection, create_access_token
 from database.models import User
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -94,21 +94,46 @@ async def get_my_profile(current_user: dict = Depends(get_current_user)):
 # UPDATE USER (admin or self)
 # ----------------------------
 @router.put("/{user_id}")
-async def update_user(user_id: str, updates: dict, current_user: dict = Depends(get_current_user)):
+async def update_user(
+    user_id: str,
+    updates: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    # 1. Fetch user
     user = await users_collection.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # 2. Permission check
     if str(current_user["id"]) != str(user_id) and str(current_user.get("role")) != "admin":
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # 3. Protect sensitive fields
     protected_fields = {"id", "email", "role"}
     updates = {k: v for k, v in updates.items() if k not in protected_fields}
+
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
+    # 4. Apply updates
     await users_collection.update_one({"id": user_id}, {"$set": updates})
-    return {"message": "User updated successfully"}
+
+    # 5. Fetch updated user
+    updated_user = await users_collection.find_one({"id": user_id})
+
+    # 6. Create new token (always generate on update)
+    token_data = {
+        "sub": updated_user["username"],
+        "role": updated_user["role"],
+        "id": updated_user["id"],
+    }
+    new_access_token = create_access_token(token_data)
+
+    # 7. Return response
+    return {
+        "message": "User updated successfully",
+        "access_token": new_access_token,
+    }
 
 # ----------------------------
 # DELETE USER (admin or self)
