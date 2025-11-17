@@ -103,7 +103,7 @@ async def rag_multiple_books_answer(
     # Step 3: Download PDFs for selected contexts
     # ----------------------------
     downloaded_files = []
-    clear_downloads_folder()
+    # clear_downloads_folder()
     for c in selected_contexts:
         source_pdf = c.get("source_pdf")
         if source_pdf:

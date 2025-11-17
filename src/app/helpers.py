@@ -187,7 +187,7 @@ except Exception as e:
     print(f"❌ Failed to initialize Qdrant client: {e}")
     QDRANT_CLIENT = None
 COLLECTION_NAME = "pdf_chunks"
-AIMODEL = "gemini-2.5-pro"
+AIMODEL = "gemini-2.0-flash-lite"
 client_genai = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 
