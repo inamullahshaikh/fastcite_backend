@@ -1,250 +1,350 @@
 """
-PDF Chunk Extractor - Optimized and Clean
-Extracts smart chunks from PDFs with automatic filtering
+PDF Chunk Extractor - TOC Tree Based
+Clean semantic chunking algorithm that preserves section boundaries
 """
 
 import fitz  # PyMuPDF
 import os
 import json
 import re
-from typing import List, Dict, Tuple
+import uuid
+from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+
+try:
+    import tiktoken
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
 
 
 # ============================================================================
 # EXCLUSION PATTERNS
 # ============================================================================
 
-DEFAULT_EXCLUDE_PATTERNS = [
-    # Publishing/Legal
+FRONT_MATTER_PATTERNS = [
     r'\b(title|cover|copyright|half-title)\s+page\b',
     r'\b(publisher|publication|imprint|colophon|permissions?)\b',
-    
-    # Front matter
     r'\b(preface|foreword|acknowledgment|acknowledgement|dedication)\b',
     r'\babout\s+(the\s+)?(author|editor|contributor)s?\b',
     r'\b(table\s+of\s+)?contents\b',
     r'\blist\s+of\s+(figures?|tables?|illustrations?)\b',
-    
-    # Back matter
+]
+
+BACK_MATTER_PATTERNS = [
     r'\b(appendix|appendices|glossary|index)\b',
     r'\b(bibliography|references?|works?\s+cited)\b',
     r'\b(further|recommended)\s+reading\b',
     r'\b(end)?notes?\b$',
-    
-    # Marketing/Misc
-    r'\b(blank|empty)\s+page\b',
     r'\balso\s+by\b',
     r'\b(praise|testimonial)s?\b',
 ]
 
 
-def should_exclude_section(title: str, path: List[str], custom_patterns: List[str] = None) -> Tuple[bool, str]:
-    """Check if section should be excluded based on title/path."""
-    patterns = DEFAULT_EXCLUDE_PATTERNS + (custom_patterns or [])
+def should_exclude(title: str, path: List[str], patterns: List[str]) -> bool:
+    """Check if section matches exclusion patterns."""
     full_text = f"{title} {' '.join(path)}".lower()
-    
-    for pattern in patterns:
-        if re.search(pattern, full_text, re.IGNORECASE):
-            return True, pattern
-    
-    return False, ""
-
-
-def should_exclude_by_content(text: str, max_check_length: int = 2000) -> Tuple[bool, str]:
-    """Check if section should be excluded based on its content (early pages check)."""
-    # Only check first portion of text for efficiency
-    sample = text[:max_check_length].lower()
-    
-    # Patterns that indicate front matter content
-    front_matter_indicators = [
-        (r'copyright.*?all rights reserved', 'copyright notice'),
-        (r'isbn[-\s]?\d', 'ISBN/publication info'),
-        (r'library of congress', 'cataloging data'),
-        (r'published by|publisher|printing.*?edition', 'publisher info'),
-        (r'about the authors?.*?university', 'about authors'),
-        (r'dedication.*?to\s+\w+\s+and', 'dedication'),
-        (r'preface.*?welcome to', 'preface content'),
-        (r'table of contents.*?chapter', 'table of contents'),
-    ]
-    
-    for pattern, reason in front_matter_indicators:
-        if re.search(pattern, sample, re.IGNORECASE | re.DOTALL):
-            return True, reason
-    
-    return False, ""
+    return any(re.search(pattern, full_text, re.IGNORECASE) for pattern in patterns)
 
 
 # ============================================================================
-# TOC PROCESSING
+# TOC TREE BUILDING
 # ============================================================================
 
 def build_toc_tree(toc: List) -> Dict:
     """Build nested TOC tree from PyMuPDF table of contents."""
-    root = {"title": "root", "page": 0, "children": []}
+    root = {"title": "root", "page": 0, "level": 0, "children": []}
     stack = [root]
     
     for level, title, page in toc:
-        node = {"title": title, "page": page, "children": []}
-        while len(stack) > level:
+        node = {"title": title, "page": page, "level": level, "children": []}
+        
+        # Pop stack to correct level
+        while len(stack) > level + 1:
             stack.pop()
+        
+        # Add to parent
         stack[-1]["children"].append(node)
         stack.append(node)
     
     return root
 
 
-def collect_sections(node: Dict, parent_path: List[str] = None) -> List[Dict]:
-    """Collect all leaf sections from TOC tree."""
+def flatten_tree(node: Dict, parent_path: List[str] = None) -> List[Dict]:
+    """Flatten tree into list of all nodes with their paths."""
     if parent_path is None:
         parent_path = []
     
+    nodes = []
     path = parent_path + ([node["title"]] if node["title"] != "root" else [])
-    sections = []
     
-    if not node["children"]:
-        # Leaf node
-        sections.append({
+    if node["title"] != "root":
+        nodes.append({
             "title": node["title"],
             "page": node["page"],
-            "path": path
+            "level": node["level"],
+            "path": path,
+            "children": node["children"]
         })
-    else:
-        # Recurse into children
-        for child in node["children"]:
-            sections.extend(collect_sections(child, path))
     
-    return sections
+    for child in node["children"]:
+        nodes.extend(flatten_tree(child, path))
+    
+    return nodes
+
+
+# ============================================================================
+# CALCULATE SECTION BOUNDARIES
+# ============================================================================
+
+def calculate_section_end(node: Dict, all_nodes: List[Dict], total_pages: int) -> int:
+    """
+    Calculate end page for a section.
+    End is exclusive - content goes from start_page to end_page (exclusive).
+    """
+    start_page = node["page"]
+    level = node["level"]
+    
+    # If section has children, it ends at first child's start page
+    if node.get("children"):
+        first_child_page = node["children"][0]["page"]
+        if first_child_page > start_page:
+            return first_child_page
+    
+    # Find next section at same or higher level (sibling or parent's sibling)
+    for other in all_nodes:
+        if other["page"] > start_page and other["level"] <= level:
+            return other["page"]
+    
+    # No next section found - goes to end of document
+    return total_pages + 1
 
 
 # ============================================================================
 # TEXT EXTRACTION
 # ============================================================================
 
-def extract_text(doc: fitz.Document, start_page: int, end_page: int) -> str:
-    """Extract text from page range (1-indexed, inclusive)."""
+def find_heading_on_page(page, heading_title: str) -> int:
+    """Find heading position on page. Returns character index or -1."""
+    text = page.get_text("text")
+    if not text:
+        return -1
+    
+    heading_lower = heading_title.lower().strip()
+    text_lower = text.lower()
+    
+    # Try exact match
+    idx = text_lower.find(heading_lower)
+    if idx != -1:
+        return idx
+    
+    # Try normalized whitespace
+    heading_norm = re.sub(r'\s+', ' ', heading_lower)
+    text_norm = re.sub(r'\s+', ' ', text_lower)
+    idx = text_norm.find(heading_norm)
+    if idx != -1:
+        # Approximate mapping back
+        return min(len(text), idx + (len(text) - len(text_norm)) // 2)
+    
+    # Try number pattern (e.g., "3.4" from "3.4 Principles...")
+    number_match = re.search(r'\d+\.\d+', heading_title)
+    if number_match:
+        idx = text_lower.find(number_match.group())
+        if idx != -1:
+            return idx
+    
+    return -1
+
+
+def extract_section_text(doc: fitz.Document, start_page: int, end_page: int, 
+                         heading_title: str = None) -> str:
+    """
+    Extract text for a section.
+    start_page: 1-indexed, inclusive
+    end_page: 1-indexed, exclusive
+    heading_title: If provided, find heading on first page and start from there
+    """
     text_parts = []
-    for page_num in range(start_page - 1, end_page):
+    
+    for page_num in range(start_page - 1, end_page - 1):
         if 0 <= page_num < len(doc):
-            text_parts.append(doc.load_page(page_num).get_text("text"))
+            page = doc.load_page(page_num)
+            page_text = page.get_text("text")
+            
+            # On first page, find heading position if provided
+            if page_num == start_page - 1 and heading_title:
+                heading_pos = find_heading_on_page(page, heading_title)
+                if heading_pos > 0:
+                    page_text = page_text[heading_pos:].lstrip()
+            
+            text_parts.append(page_text)
+    
     return "\n".join(text_parts).strip()
 
 
-def estimate_tokens(text: str) -> int:
-    """Estimate token count (rough approximation)."""
+# ============================================================================
+# TOKEN COUNTING
+# ============================================================================
+
+def count_tokens(text: str) -> int:
+    """Count tokens in text. Uses tiktoken if available, else estimates."""
+    if HAS_TIKTOKEN:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except:
+            pass
+    
+    # Fallback: rough estimate (1 token ≈ 0.75 words)
     return int(len(text.split()) * 1.3)
 
 
 # ============================================================================
-# PDF OPERATIONS
+# CHUNK SPLITTING (at subsection boundaries only)
 # ============================================================================
 
-def save_mini_pdf(doc: fitz.Document, start_page: int, end_page: int, 
-                  output_dir: str, book_id: str) -> Tuple[str, str]:
-    """Save subset of pages as mini-PDF."""
-    os.makedirs(output_dir, exist_ok=True)
+def split_large_section(section: Dict, doc: fitz.Document, max_tokens: int,
+                        all_sections: List[Dict]) -> List[Dict]:
+    """
+    Split a large section into smaller chunks at subsection boundaries.
+    Never splits in the middle of a subsection.
+    """
+    # Handle both formats: section dict from tree or processed chunk
+    start_page = section.get("start_page") or section.get("page")
+    end_page = section.get("end_page_exclusive") or section.get("end_page")
+    section_path = section.get("path")
+    section_title = section.get("title", "")
     
-    mini_doc = fitz.open()
-    for page_num in range(start_page - 1, end_page):
-        if 0 <= page_num < len(doc):
-            mini_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+    if not all([start_page, end_page, section_path]):
+        # If we can't get required fields, return section as-is (with text if it exists)
+        if "text" in section:
+            # Ensure end_page_exclusive exists if we have end_page
+            if "end_page_exclusive" not in section and end_page:
+                section["end_page_exclusive"] = end_page
+            return [section]
+        # Otherwise extract text
+        if start_page and end_page:
+            text = extract_section_text(doc, start_page, end_page, section_title)
+            section["text"] = text
+            section["token_count"] = count_tokens(text)
+            section["end_page_exclusive"] = end_page
+            section["end_page"] = end_page - 1
+        return [section]
     
-    filename = f"{book_id}_{start_page}_{end_page - 1}.pdf"
-    filepath = os.path.join(output_dir, filename)
+    # Check token count - if already small enough, ensure text exists and return
+    token_count = section.get("token_count", 0)
+    if token_count == 0:
+        # Extract text to get token count
+        text = extract_section_text(doc, start_page, end_page, section_title)
+        token_count = count_tokens(text)
+        section["text"] = text
+        section["token_count"] = token_count
     
-    mini_doc.save(filepath)
-    mini_doc.close()
+    if token_count <= max_tokens:
+        # Ensure section has all required fields
+        if "text" not in section:
+            section["text"] = extract_section_text(doc, start_page, end_page, section_title)
+        # Ensure end_page_exclusive exists
+        if "end_page_exclusive" not in section:
+            section["end_page_exclusive"] = end_page
+        # Ensure end_page is inclusive for display
+        if "end_page" not in section or section.get("end_page") != end_page - 1:
+            section["end_page"] = end_page - 1
+        return [section]
     
-    return filepath, filename
-
-
-# ============================================================================
-# CHUNK OPTIMIZATION
-# ============================================================================
-
-def should_merge(current: Dict, next_chunk: Dict) -> bool:
-    """Check if two chunks should be merged (same parent)."""
-    if len(current["path"]) != len(next_chunk["path"]):
-        return False
-    if len(current["path"]) > 1:
-        return current["path"][:-1] == next_chunk["path"][:-1]
-    return True
-
-
-def optimize_chunks(sections: List[Dict], doc: fitz.Document, page_count: int,
-                   min_pages: int = 2, max_pages: int = 25,
-                   min_tokens: int = 300, max_tokens: int = 6000) -> List[Dict]:
-    """Merge small consecutive sections into optimized chunks."""
+    # Find all subsections (direct children) within this section
+    subsection_boundaries = []
     
-    if not sections:
-        return []
+    for subsec in all_sections:
+        subsec_path = subsec["path"]
+        # Check if this is a direct child (one level deeper)
+        if (len(subsec_path) == len(section_path) + 1 and
+            subsec_path[:-1] == section_path and
+            start_page <= subsec["page"] < end_page):
+            # Use subsection's END page as boundary
+            subsection_boundaries.append(subsec["end_page"])
     
+    # Sort boundaries
+    subsection_boundaries = sorted(set(subsection_boundaries))
+    # Filter to only boundaries within our range
+    subsection_boundaries = [b for b in subsection_boundaries if start_page < b < end_page]
+    
+    # If no subsections found, cannot split without breaking semantic structure
+    if not subsection_boundaries:
+        # Ensure section has text and all required fields before returning
+        if "text" not in section:
+            section["text"] = extract_section_text(doc, start_page, end_page, section_title)
+        if "end_page_exclusive" not in section:
+            section["end_page_exclusive"] = end_page
+        if "end_page" not in section or section.get("end_page") != end_page - 1:
+            section["end_page"] = end_page - 1
+        return [section]
+    
+    # Split at subsection boundaries
     chunks = []
-    i = 0
+    current_start = start_page
+    part_num = 1
     
-    while i < len(sections):
-        # Start new chunk
-        start_page = sections[i]["page"]
-        end_page = sections[i + 1]["page"] if i + 1 < len(sections) else page_count + 1
-        merged_titles = [sections[i]["title"]]
-        path = sections[i]["path"]
+    for boundary in subsection_boundaries:
+        # Extract text up to boundary
+        text = extract_section_text(doc, current_start, boundary,
+                                   section["title"] if part_num == 1 else None)
+        tokens = count_tokens(text)
         
-        # Extract initial text
-        text = extract_text(doc, start_page, end_page)
-        tokens = estimate_tokens(text)
-        pages = end_page - start_page
+        if tokens > 0:
+            chunk = {
+                "title": f"{section['title']} (Part {part_num})" if part_num > 1 else section["title"],
+                "path": section["path"],
+                "level": section["level"],
+                "start_page": current_start,
+                "end_page": boundary - 1,  # Convert to inclusive for display
+                "end_page_exclusive": boundary,
+                "token_count": tokens,
+                "text": text
+            }
+            chunks.append(chunk)
+            part_num += 1
         
-        # Try merging with following sections
-        j = i + 1
-        while j < len(sections):
-            next_end = sections[j + 1]["page"] if j + 1 < len(sections) else page_count + 1
-            potential_pages = next_end - start_page
-            
-            # Check merge conditions
-            can_merge = (
-                (pages < min_pages or tokens < min_tokens) and
-                potential_pages <= max_pages and
-                should_merge(sections[i], sections[j])
-            )
-            
-            if not can_merge:
-                break
-            
-            # Merge
-            end_page = next_end
-            merged_titles.append(sections[j]["title"])
-            text = extract_text(doc, start_page, end_page)
-            tokens = estimate_tokens(text)
-            pages = end_page - start_page
-            j += 1
-        
-        # Check if merged chunk is too large
-        if pages > max_pages or tokens > max_tokens:
-            # Don't merge, use just first section
-            end_page = sections[i + 1]["page"] if i + 1 < len(sections) else page_count + 1
-            merged_titles = [sections[i]["title"]]
-            text = extract_text(doc, start_page, end_page)
-            tokens = estimate_tokens(text)
-            pages = end_page - start_page
-            j = i + 1
-        
-        # Create chunk
-        title = " - ".join(merged_titles) if len(merged_titles) > 1 else merged_titles[0]
-        
-        chunks.append({
-            "title": title,
-            "original_titles": merged_titles,
-            "path": path,
-            "start_page": start_page,
-            "end_page": end_page - 1,
-            "page_count": pages,
-            "token_count": tokens,
-            "text": text
-        })
-        
-        i = j
+        current_start = boundary
     
-    return chunks
+    # Handle remaining content after last subsection
+    if current_start < end_page:
+        text = extract_section_text(doc, current_start, end_page, None)
+        tokens = count_tokens(text)
+        if tokens > 0:
+            chunk = {
+                "title": f"{section['title']} (Part {part_num})" if part_num > 1 else section["title"],
+                "path": section["path"],
+                "level": section["level"],
+                "start_page": current_start,
+                "end_page": end_page - 1,
+                "end_page_exclusive": end_page,
+                "token_count": tokens,
+                "text": text
+            }
+            chunks.append(chunk)
+    
+    # Recursively split any chunks that are still too large
+    final_chunks = []
+    for chunk in chunks:
+        if chunk["token_count"] > max_tokens:
+            # Create a section dict for recursive splitting (include text)
+            sub_section = {
+                "title": chunk["title"],
+                "path": chunk["path"],
+                "level": chunk["level"],
+                "start_page": chunk["start_page"],
+                "end_page": chunk["end_page_exclusive"],
+                "end_page_exclusive": chunk["end_page_exclusive"],
+                "token_count": chunk["token_count"],
+                "text": chunk["text"]  # Include text for recursive calls
+            }
+            further_split = split_large_section(sub_section, doc, max_tokens, all_sections)
+            final_chunks.extend(further_split)
+        else:
+            final_chunks.append(chunk)
+    
+    return final_chunks
 
 
 # ============================================================================
@@ -256,182 +356,233 @@ def extract_pdf_chunks(
     output_dir: str = "output",
     book_id: str = None,
     save_mini_pdfs: bool = True,
-    min_pages: int = 2,
-    max_pages: int = 25,
-    min_tokens: int = 300,
-    max_tokens: int = 6000,
+    min_tokens: int = 200,
+    max_tokens: int = 2000,
     exclude_sections: bool = True,
-    custom_exclude_patterns: List[str] = None
+    custom_exclude_front: List[str] = None,
+    custom_exclude_back: List[str] = None
 ) -> Dict:
     """
-    Extract optimized chunks from PDF.
-    
-    Args:
-        pdf_path: Path to PDF file
-        output_dir: Output directory
-        book_id: Book identifier (defaults to filename)
-        save_mini_pdfs: Whether to save mini-PDF files
-        min_pages: Minimum pages per chunk
-        max_pages: Maximum pages per chunk
-        min_tokens: Minimum tokens per chunk
-        max_tokens: Maximum tokens per chunk
-        exclude_sections: Whether to exclude non-content sections
-        custom_exclude_patterns: Additional exclusion patterns
-    
-    Returns:
-        Dictionary with chunks and metadata
+    Extract semantic chunks from PDF based on TOC structure.
     """
     
-    # Setup
     if book_id is None:
-        book_id = os.path.splitext(os.path.basename(pdf_path))[0]
+        book_id = str(uuid.uuid4())
     
     print(f"📖 Processing: {pdf_path}")
     print(f"📝 Book ID: {book_id}\n")
     
     # Open PDF
     doc = fitz.open(pdf_path)
-    page_count = len(doc)
+    total_pages = len(doc)
     toc = doc.get_toc()
     
-    print(f"📄 Total pages: {page_count}")
+    print(f"📄 Total pages: {total_pages}")
     print(f"📑 TOC entries: {len(toc)}\n")
     
-    # Build sections from TOC
+    # Build TOC tree
     if not toc:
         print("⚠️  No TOC found - creating single chunk for entire document\n")
-        sections = [{
-            "title": "Full Document",
-            "page": 1,
-            "path": ["Full Document"]
-        }]
+        toc_tree = {
+            "title": "root",
+            "page": 0,
+            "level": 0,
+            "children": [{
+                "title": "Full Document",
+                "page": 1,
+                "level": 1,
+                "children": []
+            }]
+        }
     else:
         toc_tree = build_toc_tree(toc)
-        sections = collect_sections(toc_tree)
     
-    # Filter excluded sections
+    # Flatten tree to list of all sections
+    all_sections = flatten_tree(toc_tree)
+    
+    # Calculate end pages for all sections
+    for section in all_sections:
+        section["end_page"] = calculate_section_end(section, all_sections, total_pages)
+    
+    print(f"🌳 Found {len(all_sections)} sections in TOC\n")
+    
+    # Filter out front and back matter
     filtered_sections = []
     excluded_list = []
     
     if exclude_sections:
-        for section in sections:
-            # First check by title/path
-            should_exclude, pattern = should_exclude_section(
-                section["title"],
-                section["path"],
-                custom_exclude_patterns
-            )
-            
-            if should_exclude:
-                excluded_list.append({
-                    "title": section["title"],
-                    "path": " > ".join(section["path"]),
-                    "reason": f"title pattern: {pattern}"
-                })
-                continue
-            
-            # For early sections (first 50 pages), also check content
-            if section["page"] <= 50:
-                end_page = sections[sections.index(section) + 1]["page"] if sections.index(section) + 1 < len(sections) else page_count + 1
-                text_sample = extract_text(doc, section["page"], min(end_page, section["page"] + 5))
-                
-                should_exclude_content, reason = should_exclude_by_content(text_sample)
-                if should_exclude_content:
+        # Find main content boundaries
+        first_content_idx = 0
+        for i, section in enumerate(all_sections):
+            if not should_exclude(section["title"], section["path"], FRONT_MATTER_PATTERNS):
+                title_lower = section["title"].lower()
+                if any(kw in title_lower for kw in ['chapter', 'part', 'section', 'introduction']):
+                    first_content_idx = i
+                    break
+                elif section["page"] > 30:
+                    first_content_idx = i
+                    break
+        
+        last_content_idx = len(all_sections) - 1
+        for i in range(len(all_sections) - 1, -1, -1):
+            if not should_exclude(all_sections[i]["title"], all_sections[i]["path"], BACK_MATTER_PATTERNS):
+                last_content_idx = i
+                break
+        
+        print(f"📍 Main content: sections {first_content_idx} to {last_content_idx}\n")
+        
+        # Filter sections
+        for i, section in enumerate(all_sections):
+            if i < first_content_idx:
+                if should_exclude(section["title"], section["path"], FRONT_MATTER_PATTERNS) or section["page"] <= 20:
                     excluded_list.append({
                         "title": section["title"],
                         "path": " > ".join(section["path"]),
-                        "reason": f"content: {reason}"
+                        "reason": "front matter"
+                    })
+                    continue
+            
+            if i > last_content_idx:
+                excluded_list.append({
+                    "title": section["title"],
+                    "path": " > ".join(section["path"]),
+                    "reason": "back matter"
+                })
+                continue
+            
+            # Exclude parent sections that have children starting on same page
+            # (no unique content)
+            if section.get("children") and section["children"]:
+                if section["children"][0]["page"] == section["page"]:
+                    excluded_list.append({
+                        "title": section["title"],
+                        "path": " > ".join(section["path"]),
+                        "reason": "parent with child on same page"
                     })
                     continue
             
             filtered_sections.append(section)
     else:
-        filtered_sections = sections
+        filtered_sections = all_sections
     
     if excluded_list:
-        print(f"🚫 Excluded {len(excluded_list)} sections:")
-        for exc in excluded_list[:10]:
-            print(f"   • {exc['title']}")
-        if len(excluded_list) > 10:
-            print(f"   ... and {len(excluded_list) - 10} more")
-        print()
+        print(f"🚫 Excluded {len(excluded_list)} sections\n")
     
-    # Optimize chunks
-    optimized = optimize_chunks(
-        filtered_sections, doc, page_count,
-        min_pages, max_pages, min_tokens, max_tokens
-    )
+    # Process sections into chunks
+    print(f"📊 Processing {len(filtered_sections)} sections into chunks...\n")
     
-    print(f"📊 Created {len(optimized)} optimized chunks\n")
+    all_chunks = []
     
-    # Save mini-PDFs and prepare final chunks
-    pdf_dir = os.path.join(output_dir, "mini_pdfs")
-    final_chunks = []
-    
-    for idx, chunk in enumerate(optimized, 1):
-        if not chunk["text"].strip():
-            print(f"⚠️  Skipping empty chunk: {chunk['title']}")
+    for section in filtered_sections:
+        # Extract text for this section
+        text = extract_section_text(doc, section["page"], section["end_page"], section["title"])
+        tokens = count_tokens(text)
+        
+        if tokens < min_tokens:
+            # Skip very small sections (likely empty or just headings)
             continue
         
-        chunk_data = {
-            "chunk_id": idx,
-            "title": chunk["title"],
-            "original_titles": chunk["original_titles"],
-            "path": " > ".join(chunk["path"]),
-            "hierarchy": chunk["path"],
-            "start_page": chunk["start_page"],
-            "end_page": chunk["end_page"],
-            "page_count": chunk["page_count"],
-            "token_count": chunk["token_count"],
-            "text": chunk["text"],
-            "text_preview": chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"]
+        # Create chunk
+        chunk = {
+            "title": section["title"],
+            "path": " > ".join(section["path"]),
+            "path_array": section["path"],
+            "level": section["level"],
+            "start_page": section["page"],
+            "end_page": section["end_page"] - 1,  # Convert to inclusive
+            "end_page_exclusive": section["end_page"],
+            "token_count": tokens,
+            "text": text
         }
         
-        if save_mini_pdfs:
-            local_path, filename = save_mini_pdf(
-                doc, chunk["start_page"], chunk["end_page"] + 1,
-                pdf_dir, book_id
-            )
-            chunk_data["local_path"] = local_path
-            chunk_data["filename"] = filename
+        # If chunk is too large, split at subsection boundaries
+        if tokens > max_tokens:
+            # Prepare section dict for splitting function with correct keys
+            section_for_splitting = {
+                "title": section["title"],
+                "path": section["path"],
+                "level": section["level"],
+                "start_page": section["page"],  # Use "page" from section
+                "end_page": section["end_page"],  # This is already exclusive
+                "end_page_exclusive": section["end_page"],
+                "token_count": tokens
+            }
+            split_chunks = split_large_section(section_for_splitting, doc, max_tokens, all_sections)
+            # Convert split chunks to final format
+            for split_chunk in split_chunks:
+                # Ensure end_page_exclusive exists
+                end_page_exclusive = split_chunk.get("end_page_exclusive")
+                if end_page_exclusive is None:
+                    # If not present, convert from inclusive end_page
+                    end_page_exclusive = split_chunk.get("end_page", 0) + 1
+                
+                final_chunk = {
+                    "chunk_id": str(uuid.uuid4()),
+                    "book_id": book_id,
+                    "title": split_chunk["title"],
+                    "path": " > ".join(split_chunk["path"]),
+                    "path_array": split_chunk["path"],
+                    "level": split_chunk["level"],
+                    "start_page": split_chunk["start_page"],
+                    "end_page": split_chunk.get("end_page", end_page_exclusive - 1),
+                    "end_page_exclusive": end_page_exclusive,
+                    "token_count": split_chunk["token_count"],
+                    "text": split_chunk["text"]
+                }
+                all_chunks.append(final_chunk)
+        else:
+            chunk["chunk_id"] = str(uuid.uuid4())
+            chunk["book_id"] = book_id
+            all_chunks.append(chunk)
+    
+    # Save mini-PDFs if requested
+    if save_mini_pdfs:
+        pdf_dir = os.path.join(output_dir, "mini_pdfs")
+        os.makedirs(pdf_dir, exist_ok=True)
         
-        final_chunks.append(chunk_data)
-        
-        print(f"  ✓ Chunk {idx}: {chunk['title'][:60]}... "
-              f"(pp.{chunk['start_page']}-{chunk['end_page']}, "
-              f"{chunk['page_count']}pg, ~{chunk['token_count']}tok)")
+        for chunk in all_chunks:
+            # Ensure end_page_exclusive exists (convert from inclusive end_page if needed)
+            end_page_exclusive = chunk.get("end_page_exclusive")
+            if end_page_exclusive is None:
+                end_page_exclusive = chunk["end_page"] + 1  # Convert inclusive to exclusive
+            
+            mini_doc = fitz.open()
+            for page_num in range(chunk["start_page"] - 1, end_page_exclusive - 1):
+                if 0 <= page_num < len(doc):
+                    mini_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            
+            filename = f"{chunk['chunk_id']}_{chunk['start_page']}_{chunk['end_page']}.pdf"
+            filepath = os.path.join(pdf_dir, filename)
+            mini_doc.save(filepath)
+            mini_doc.close()
+            
+            chunk["filename"] = filename
+            chunk["local_path"] = filepath
+            chunk["end_page_exclusive"] = end_page_exclusive  # Ensure it's set
     
     doc.close()
     
-    # Calculate statistics
-    original_count = len(toc) if toc else page_count
-    new_count = len(final_chunks)
-    reduction = ((original_count - new_count) / original_count * 100) if original_count > 0 else 0
-    avg_pages = sum(c['page_count'] for c in final_chunks) / len(final_chunks) if final_chunks else 0
-    avg_tokens = sum(c['token_count'] for c in final_chunks) / len(final_chunks) if final_chunks else 0
-    
     # Prepare result
+    avg_tokens = sum(c["token_count"] for c in all_chunks) / len(all_chunks) if all_chunks else 0
+    
     result = {
         "metadata": {
             "book_id": book_id,
             "source_file": pdf_path,
-            "total_pages": page_count,
-            "original_toc_entries": len(toc),
+            "total_pages": total_pages,
+            "total_sections": len(all_sections),
             "excluded_sections": len(excluded_list),
-            "optimized_chunks": new_count,
-            "reduction_percentage": round(reduction, 1),
-            "avg_pages_per_chunk": round(avg_pages, 1),
+            "total_chunks": len(all_chunks),
             "avg_tokens_per_chunk": round(avg_tokens, 0),
             "processing_date": datetime.now().isoformat(),
             "parameters": {
-                "min_pages": min_pages,
-                "max_pages": max_pages,
                 "min_tokens": min_tokens,
                 "max_tokens": max_tokens,
                 "exclude_sections": exclude_sections
             }
         },
-        "chunks": final_chunks
+        "chunks": all_chunks,
+        "excluded_sections": excluded_list
     }
     
     # Save to JSON
@@ -444,15 +595,11 @@ def extract_pdf_chunks(
     # Summary
     print(f"\n✅ Processing complete!")
     print(f"📊 Statistics:")
-    print(f"   • Original sections: {original_count}")
+    print(f"   • Total sections: {len(all_sections)}")
     print(f"   • Excluded: {len(excluded_list)}")
-    print(f"   • Final chunks: {new_count}")
-    print(f"   • Reduction: {reduction:.1f}%")
-    print(f"   • Avg pages/chunk: {avg_pages:.1f}")
+    print(f"   • Final chunks: {len(all_chunks)}")
     print(f"   • Avg tokens/chunk: {avg_tokens:.0f}")
     print(f"\n💾 Saved to: {json_path}")
-    if save_mini_pdfs:
-        print(f"📁 Mini-PDFs: {pdf_dir}/")
     
     return result
 
@@ -466,27 +613,18 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Extract optimized chunks from PDF',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python pdf_chunk_extractor.py book.pdf
-  python pdf_chunk_extractor.py book.pdf --no-exclude
-  python pdf_chunk_extractor.py book.pdf --min-pages 3 --max-pages 30
-  python pdf_chunk_extractor.py book.pdf --exclude-pattern "\\bexercises?\\b"
-        """
+        description='Extract semantic chunks from PDF based on TOC structure'
     )
     
-    parser.add_argument('--pdf_path',default="book2.pdf", help='Path to PDF file')
-    parser.add_argument('--output-dir', default='output2', help='Output directory (default: output)')
-    parser.add_argument('--book-id', help='Book identifier (default: filename)')
+    parser.add_argument('pdf_path', help='Path to PDF file')
+    parser.add_argument('--output-dir', default='output', help='Output directory (default: output)')
+    parser.add_argument('--book-id', help='Book identifier (default: UUID)')
     parser.add_argument('--no-mini-pdfs', action='store_true', help='Skip saving mini-PDFs')
-    parser.add_argument('--min-pages', type=int, default=2, help='Minimum pages per chunk (default: 2)')
-    parser.add_argument('--max-pages', type=int, default=25, help='Maximum pages per chunk (default: 25)')
-    parser.add_argument('--min-tokens', type=int, default=300, help='Minimum tokens per chunk (default: 300)')
-    parser.add_argument('--max-tokens', type=int, default=6000, help='Maximum tokens per chunk (default: 6000)')
-    parser.add_argument('--no-exclude', action='store_true', help='Don\'t exclude non-content sections')
-    parser.add_argument('--exclude-pattern', action='append', help='Additional exclusion patterns (regex)')
+    parser.add_argument('--min-tokens', type=int, default=200, help='Minimum tokens per chunk (default: 200)')
+    parser.add_argument('--max-tokens', type=int, default=2000, help='Maximum tokens per chunk (default: 2000)')
+    parser.add_argument('--no-exclude', action='store_true', help='Don\'t exclude front/back matter')
+    parser.add_argument('--exclude-front', action='append', help='Additional front matter patterns (regex)')
+    parser.add_argument('--exclude-back', action='append', help='Additional back matter patterns (regex)')
     
     args = parser.parse_args()
     
@@ -500,12 +638,11 @@ Examples:
             output_dir=args.output_dir,
             book_id=args.book_id,
             save_mini_pdfs=not args.no_mini_pdfs,
-            min_pages=args.min_pages,
-            max_pages=args.max_pages,
             min_tokens=args.min_tokens,
             max_tokens=args.max_tokens,
             exclude_sections=not args.no_exclude,
-            custom_exclude_patterns=args.exclude_pattern
+            custom_exclude_front=args.exclude_front,
+            custom_exclude_back=args.exclude_back
         )
         return 0
     except Exception as e:
