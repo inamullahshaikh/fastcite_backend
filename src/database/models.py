@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict
 from uuid import UUID, uuid4
 from datetime import date, datetime
 
@@ -111,7 +111,7 @@ class Book(BaseModel):
     pages: Optional[int] = None
     status: Literal["processing", "complete"]
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
-    uploaded_by: List[str] = Field(default_factory=list)
+    uploaded_by: Dict[str, str] = Field(default_factory=dict)  # {user_id: book_name}
 
     class Config:
         json_schema_extra = {
@@ -121,7 +121,7 @@ class Book(BaseModel):
                 "pages": 360,
                 "status": "processing",
                 "uploaded_at": "2025-10-30T12:00:00Z",
-                "uploaded_by": ["inam123"]
+                "uploaded_by": {"user-id-123": "My Custom Book Name"}
             }
         }
 

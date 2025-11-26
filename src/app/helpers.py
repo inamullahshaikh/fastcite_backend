@@ -146,7 +146,37 @@ def collect_leaf_nodes(node, path=None):
 def extract_metadata(doc):
     """Extract metadata (title, author) from a PDF document."""
     meta = doc.metadata or {}
-    return meta.get("title", "Unknown Title"), meta.get("author", "Unknown Author")
+    # Return None for missing title instead of "Unknown Title" to allow validation
+    title = meta.get("title") or None
+    
+    # Ensure title is a string if it exists
+    if title is not None:
+        if not isinstance(title, str):
+            # Handle case where title might be an object or other type
+            if isinstance(title, dict):
+                title = str(title.get("title", title.get("name", "")))
+            else:
+                title = str(title)
+        # Strip whitespace and check if empty
+        if title and title.strip():
+            title = title.strip()
+        else:
+            title = None
+    
+    author = meta.get("author") or None
+    # Ensure author is a string if it exists
+    if author is not None:
+        if not isinstance(author, str):
+            if isinstance(author, dict):
+                author = str(author.get("author", author.get("name", "")))
+            else:
+                author = str(author)
+        if author and author.strip():
+            author = author.strip()
+        else:
+            author = None
+    
+    return title, author
 
 
 def extract_text_for_node(doc, start_page, end_page):

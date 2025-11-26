@@ -10,28 +10,72 @@ from datetime import datetime
 from qdrant_client.http.exceptions import UnexpectedResponse
 import re
 import json
+import hashlib
 from app.helpers import *
 from app.embedder import embedder
+from app.book_chunker import BookChunker
 
 # ------------------ Sub-tasks for PDF Processing (LOW PRIORITY - Background) ------------------ #
 
 @celery_app.task(name="initialize_qdrant_collection_task", queue='uploads')
 def initialize_qdrant_collection_task(collection_name: str = "pdf_chunks"):
-    """Initialize Qdrant collection if it doesn't exist."""
+    """Initialize Qdrant collection if it doesn't exist and ensure required indexes exist."""
     if not QDRANT_CLIENT:
         raise EnvironmentError("Qdrant client not initialized.")
     
     existing = [c.name for c in QDRANT_CLIENT.get_collections().collections]
+    collection_created = False
+    
     if collection_name not in existing:
         QDRANT_CLIENT.create_collection(
             collection_name=collection_name,
-            vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
+            vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),  # all-mpnet-base-v2 produces 768-dim embeddings
         )
         print("✅ Qdrant collection created.")
-        return {"status": "created", "collection_name": collection_name}
+        collection_created = True
     else:
         print("ℹ️ Using existing Qdrant collection.")
-        return {"status": "exists", "collection_name": collection_name}
+    
+    # Ensure required indexes exist with explicit schema types
+    # Qdrant requires explicit field_schema when collection is empty or can't auto-detect
+    required_indexes = [
+        # Critical string fields (KEYWORD)
+        {"field_name": "book_id", "field_schema": models.PayloadSchemaType.KEYWORD},  # Critical for deletion operations
+        {"field_name": "chunk_id", "field_schema": models.PayloadSchemaType.KEYWORD},
+        {"field_name": "book_name", "field_schema": models.PayloadSchemaType.KEYWORD},
+        {"field_name": "author_name", "field_schema": models.PayloadSchemaType.KEYWORD},
+        {"field_name": "heading", "field_schema": models.PayloadSchemaType.KEYWORD},
+        {"field_name": "path", "field_schema": models.PayloadSchemaType.KEYWORD},
+        {"field_name": "source_pdf", "field_schema": models.PayloadSchemaType.KEYWORD},
+        {"field_name": "content", "field_schema": models.PayloadSchemaType.KEYWORD},
+        {"field_name": "related_paths", "field_schema": models.PayloadSchemaType.KEYWORD},  # Array of strings
+        # Integer fields (INTEGER)
+        {"field_name": "start_page", "field_schema": models.PayloadSchemaType.INTEGER},
+        {"field_name": "end_page", "field_schema": models.PayloadSchemaType.INTEGER},
+        {"field_name": "level", "field_schema": models.PayloadSchemaType.INTEGER},
+    ]
+    
+    for idx_info in required_indexes:
+        field_name = idx_info["field_name"]
+        field_schema = idx_info["field_schema"]
+        try:
+            QDRANT_CLIENT.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=field_schema
+            )
+            print(f"✅ Created/verified index for '{field_name}'")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "already exists" in error_msg or "duplicate" in error_msg:
+                print(f"ℹ️ Index for '{field_name}' already exists")
+            else:
+                print(f"⚠️ Warning: Could not create index for '{field_name}': {e}")
+    
+    return {
+        "status": "created" if collection_created else "exists",
+        "collection_name": collection_name
+    }
 
 
 @celery_app.task(name="extract_pdf_metadata_task", queue='uploads')
@@ -41,29 +85,105 @@ def extract_pdf_metadata_task(pdf_path: str) -> Dict:
         raise FileNotFoundError(f"{pdf_path} not found.")
     
     doc = fitz.open(pdf_path)
-    toc = doc.get_toc()
-    if not toc:
-        raise ValueError("No Table of Contents found in PDF.")
+    try:
+        toc = doc.get_toc()
+        if not toc:
+            raise ValueError("No Table of Contents found in PDF.")
+        
+        title, author_name = extract_metadata(doc)
+        pages = doc.page_count
+        
+        return {
+            "title": title,
+            "author_name": author_name,
+            "pages": pages,
+            "toc": toc,
+            "page_count": doc.page_count
+        }
+    finally:
+        doc.close()
+
+
+def create_toc_fingerprint(toc_tree: Dict) -> str:
+    """
+    Create a hash fingerprint from TOC tree structure for comparison.
+    This helps identify books with the same TOC even when metadata is missing.
     
-    title, author_name = extract_metadata(doc)
-    pages = doc.page_count
+    Args:
+        toc_tree: TOC tree dictionary
+        
+    Returns:
+        SHA256 hash of the TOC structure
+    """
+    if not toc_tree:
+        return ""
     
-    return {
-        "title": title,
-        "author_name": author_name,
-        "pages": pages,
-        "toc": toc,
-        "page_count": doc.page_count
-    }
+    # Create a normalized string representation of TOC structure
+    def normalize_toc(node):
+        """Recursively normalize TOC node to string."""
+        if not node:
+            return ""
+        title = node.get("title", "")
+        page = node.get("page", 0)
+        children = node.get("children", [])
+        children_str = "|".join(sorted([normalize_toc(child) for child in children]))
+        return f"{title}:{page}[{children_str}]"
+    
+    toc_string = normalize_toc(toc_tree)
+    return hashlib.sha256(toc_string.encode()).hexdigest()
 
 
 @celery_app.task(name="check_or_create_book_task", queue='uploads')
-def check_or_create_book_task(title: str, author_name: str, pages: int, user_id: str) -> Dict:
-    """Check if book exists or create new book entry."""
-    existing_book = books_collection.find_one({"title": title})
+def check_or_create_book_task(title: str, author_name: str, pages: int, user_id: str, user_book_name: str = None, toc_tree: Dict = None) -> Dict:
+    """
+    Check if book exists or create new book entry.
+    
+    Args:
+        title: Title from PDF metadata (can be empty string)
+        author_name: Author from PDF metadata
+        pages: Number of pages
+        user_id: ID of the user uploading
+        user_book_name: User-provided book name (stored in uploaded_by dict)
+        toc_tree: Table of contents tree
+    """
+    # Ensure title is a string
+    if not isinstance(title, str):
+        title = str(title) if title else ""
+    title = title.strip()
+    
+    # Ensure author_name is a string
+    if not isinstance(author_name, str):
+        author_name = str(author_name) if author_name else ""
+    author_name = author_name.strip()
+    
+    # Ensure user_book_name is a string
+    if not user_book_name or not isinstance(user_book_name, str):
+        user_book_name = str(user_book_name) if user_book_name else (title or "Untitled")
+    user_book_name = user_book_name.strip() if user_book_name else (title or "Untitled")
+    
+    # Determine if we have metadata to match by
+    has_metadata = title and title.strip()
+    
+    existing_book = None
+    
+    if has_metadata:
+        # If we have title, match by title
+        existing_book = books_collection.find_one({"title": title})
+        print(f"🔍 Searching for book by title: {title}")
+    elif toc_tree:
+        # If no title but we have TOC, match by TOC fingerprint
+        toc_fingerprint = create_toc_fingerprint(toc_tree)
+        if toc_fingerprint:
+            existing_book = books_collection.find_one({"toc_fingerprint": toc_fingerprint})
+            print(f"🔍 Searching for book by TOC fingerprint (no metadata available)")
+        else:
+            print(f"⚠️ No TOC available and no metadata - treating as new book")
+    else:
+        # No title and no TOC - treat as new book
+        print(f"⚠️ No metadata and no TOC - treating as new book")
     
     if existing_book:
-        print(f"📚 Book already exists: {title}")
+        print(f"📚 Book already exists")
         if "id" not in existing_book:
             book_id = str(uuid.uuid4())
             books_collection.update_one(
@@ -74,32 +194,78 @@ def check_or_create_book_task(title: str, author_name: str, pages: int, user_id:
         else:
             book_id = existing_book["id"]
         
-        if user_id not in existing_book.get("uploaded_by", []):
+        # Update TOC and TOC fingerprint if provided and missing
+        update_fields = {}
+        if toc_tree and "toc" not in existing_book:
+            update_fields["toc"] = toc_tree
+            toc_fingerprint = create_toc_fingerprint(toc_tree)
+            if toc_fingerprint:
+                update_fields["toc_fingerprint"] = toc_fingerprint
+            print(f"✅ Added TOC to existing book")
+        elif toc_tree and "toc_fingerprint" not in existing_book:
+            # Add fingerprint if missing
+            toc_fingerprint = create_toc_fingerprint(toc_tree)
+            if toc_fingerprint:
+                update_fields["toc_fingerprint"] = toc_fingerprint
+        
+        if update_fields:
             books_collection.update_one(
                 {"id": book_id},
-                {"$addToSet": {"uploaded_by": user_id}}
+                {"$set": update_fields}
             )
+        
+        # Update uploaded_by dict: add user with their book name
+        uploaded_by = existing_book.get("uploaded_by", {})
+        if not isinstance(uploaded_by, dict):
+            # Migrate old list format to dict format
+            uploaded_by = {uid: existing_book.get("title", "Untitled") for uid in (uploaded_by if isinstance(uploaded_by, list) else [])}
+        
+        # Add or update user's book name
+        uploaded_by[user_id] = user_book_name or existing_book.get("title", "") or "Untitled"
+        
+        books_collection.update_one(
+            {"id": book_id},
+            {"$set": {"uploaded_by": uploaded_by}}
+        )
+        print(f"✅ Added user {user_id} to book with name: {uploaded_by[user_id]}")
         
         return {
             "book_id": book_id,
-            "title": title,
-            "author_name": author_name,
+            "title": existing_book.get("title", title),  # Use existing title if available
+            "author_name": existing_book.get("author_name", author_name),
             "status": "existing",
             "should_process": False
         }
     else:
-        print(f"🆕 New book detected: {title}")
+        print(f"🆕 New book detected (PDF title: {title or 'No title'})")
+        
         book_id = str(uuid.uuid4())
+        
+        # Create uploaded_by dict with user_id as key and user_book_name as value
+        uploaded_by = {
+            user_id: user_book_name or title or "Untitled"
+        }
+        
         new_book = {
             "id": book_id,
-            "title": title,
+            "title": title,  # PDF metadata title (can be empty)
             "author_name": author_name,
             "pages": pages,
             "status": "processing",
             "uploaded_at": datetime.utcnow(),
-            "uploaded_by": [user_id],
+            "uploaded_by": uploaded_by,  # Dict: {user_id: book_name}
         }
+        
+        # Add TOC tree and fingerprint if provided
+        if toc_tree:
+            new_book["toc"] = toc_tree
+            toc_fingerprint = create_toc_fingerprint(toc_tree)
+            if toc_fingerprint:
+                new_book["toc_fingerprint"] = toc_fingerprint
+            print(f"✅ Saving TOC tree and fingerprint for new book")
+        
         books_collection.insert_one(new_book)
+        print(f"✅ Saved book to MongoDB with uploaded_by: {uploaded_by}")
         
         return {
             "book_id": book_id,
@@ -112,38 +278,43 @@ def check_or_create_book_task(title: str, author_name: str, pages: int, user_id:
 
 @celery_app.task(name="extract_pdf_chunks_task", queue='uploads')
 def extract_pdf_chunks_task(pdf_path: str, toc: List, page_count: int, book_id: str, workers: int = 6) -> List[Dict]:
-    """Extract and process PDF chunks."""
-    doc = fitz.open(pdf_path)
-    pdf_dir = "pdfs"
-    toc_tree = build_toc_tree(toc)
-    leaf_nodes = collect_leaf_nodes(toc_tree)
-    pdf_chunks = []
-
-    def process_node(i):
-        node = leaf_nodes[i]
-        start_page = node["page"]
-        end_page = leaf_nodes[i + 1]["page"] if i + 1 < len(leaf_nodes) else page_count + 1
-        text = extract_text_for_node(doc, start_page, end_page)
-        if not text.strip():
-            return None
-        local_pdf_path, pdf_filename = save_mini_pdf(doc, start_page, end_page, pdf_dir, book_id)
-        return {
-            "title": node["title"],
-            "path": " > ".join(node["path"]),
-            "start_page": start_page,
-            "end_page": end_page - 1,
-            "local_path": local_pdf_path,
-            "filename": pdf_filename,
-            "text": text
-        }
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        for result in executor.map(process_node, range(len(leaf_nodes))):
-            if result:
-                pdf_chunks.append(result)
+    """Extract and process PDF chunks using BookChunker."""
+    # Initialize BookChunker with the provided book_id
+    chunker = BookChunker(pdf_path, book_id=book_id)
     
-    print(f"✅ Extracted {len(pdf_chunks)} chunks from PDF")
-    return pdf_chunks
+    try:
+        # Process chunks (this handles filtering, merging, and saving mini PDFs)
+        chunks = chunker.process_chunks()
+        
+        # Transform chunks to match the expected pipeline format
+        # Preserve all relevant fields from BookChunker schema
+        pdf_chunks = []
+        for chunk in chunks:
+            # Extract filename from mini_pdf_path
+            mini_pdf_path = chunk.get('mini_pdf_path', '')
+            if mini_pdf_path:
+                filename = os.path.basename(mini_pdf_path)
+            else:
+                # Fallback: generate filename if mini_pdf_path is missing
+                filename = f"{book_id}_{chunk['start_page']}_{chunk['end_page']}.pdf"
+            
+            pdf_chunks.append({
+                "chunkid": chunk.get("chunkid"),  # Preserve chunkid from BookChunker
+                "title": chunk["title"],
+                "path": chunk["path"],
+                "level": chunk.get("level"),  # Preserve TOC level
+                "start_page": chunk["start_page"],
+                "end_page": chunk["end_page"],
+                "text": chunk["text"],
+                "related_paths": chunk.get("related_paths", []),  # Preserve related paths from merged chunks
+                "local_path": mini_pdf_path,  # Full path to mini PDF
+                "filename": filename,  # Just the filename for B2 upload
+            })
+        
+        print(f"✅ Extracted {len(pdf_chunks)} chunks from PDF using BookChunker")
+        return pdf_chunks
+    finally:
+        chunker.close()
 
 
 @celery_app.task(name="upload_chunks_to_b2_task", queue='uploads')
@@ -186,14 +357,17 @@ def store_vectors_in_qdrant_task(
     batch_size: int = 50,
     collection_name: str = "pdf_chunks"
 ):
-    """Store vectors and metadata in Qdrant."""
+    """Store vectors and metadata in Qdrant using the new chunk schema."""
     if not QDRANT_CLIENT:
         raise EnvironmentError("Qdrant client not initialized.")
     
     points = []
     for chunk, vector, url in zip(chunks, vectors, urls):
+        # Use chunkid from BookChunker if available, otherwise generate one
+        chunk_id = chunk.get("chunkid") or str(uuid.uuid4())
+        
         payload = {
-            "chunk_id": str(uuid.uuid4()),
+            "chunk_id": chunk_id,  # Use chunkid from BookChunker
             "book_id": book_id,
             "book_name": title,
             "author_name": author_name,
@@ -202,8 +376,18 @@ def store_vectors_in_qdrant_task(
             "heading": chunk["title"],
             "path": chunk["path"],
             "content": chunk["text"],
+            "related_paths": chunk.get("related_paths", []),
             "source_pdf": url,
         }
+        
+        # Add optional fields if they exist
+        if "level" in chunk:
+            payload["level"] = chunk["level"]
+        # Always save related_paths if it exists (even if empty list)
+        # This ensures the field is consistently present in Qdrant for filtering
+        if "related_paths" in chunk:
+            payload["related_paths"] = chunk["related_paths"]
+        
         points.append(models.PointStruct(id=uuid.uuid4().int >> 64, vector=vector.tolist(), payload=payload))
 
     for i in range(0, len(points), batch_size):
@@ -290,6 +474,13 @@ def process_pdf_task(pdf_path: str, user_id: str, batch_size: int = 50, workers:
     """
     Main entry point for PDF upload. Quickly validates and creates book entry,
     then delegates heavy processing to background pipeline.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        user_id: ID of the user uploading the book
+        book_name: User-provided book name (stored in uploaded_by dict)
+        batch_size: Batch size for processing
+        workers: Number of workers for parallel processing
     """
     
     # Validate global clients
@@ -302,12 +493,37 @@ def process_pdf_task(pdf_path: str, user_id: str, batch_size: int = 50, workers:
     # Step 2: Extract metadata (quick operation)
     metadata = extract_pdf_metadata_task(pdf_path)
     
+    # Step 2.1: Get title from PDF metadata (or empty string if not present)
+    extracted_title = metadata.get("title")
+    print(f"✅ Extracted title: {extracted_title}")
+    # Ensure extracted_title is a string
+    if extracted_title and not isinstance(extracted_title, str):
+        if isinstance(extracted_title, dict):
+            extracted_title = str(extracted_title.get("title", extracted_title.get("name", "")))
+        else:
+            extracted_title = str(extracted_title)
+    
+    # Use extracted title or empty string
+    pdf_title = extracted_title.strip() if (extracted_title and extracted_title.strip()) else ""
+    
+    # Update metadata with PDF title
+    metadata["title"] = pdf_title
+    
+    # Use user's book_name if provided, otherwise default to PDF title
+    user_book_name = pdf_title
+    
+    # Step 2.5: Build TOC tree from raw TOC
+    toc_tree = build_toc_tree(metadata["toc"])
+    
     # Step 3: Check or create book (quick database operation)
+    # Pass user's book_name to be stored in uploaded_by dict
     book_info = check_or_create_book_task(
-        metadata["title"],
+        pdf_title,  # PDF metadata title (can be empty)
         metadata["author_name"],
         metadata["pages"],
-        user_id
+        user_id,
+        user_book_name,  # User-provided name (stored in uploaded_by)
+        toc_tree
     )
     
     # If book already exists, return immediately
@@ -331,7 +547,7 @@ def process_pdf_task(pdf_path: str, user_id: str, batch_size: int = 50, workers:
     )
     
     # Return immediately to user
-    print(f"✅ Started background processing for: {book_info['title']}")
+    print(f"✅ Started background processing for book_id: {book_info['book_id']}")
     return {
         "book_id": book_info["book_id"],
         "title": book_info["title"],
@@ -354,6 +570,21 @@ def delete_qdrant_chunks_task(book_id: str):
     collection_name = "pdf_chunks"
 
     try:
+        # Ensure book_id index exists before deletion (required for filtering)
+        try:
+            QDRANT_CLIENT.create_payload_index(
+                collection_name=collection_name,
+                field_name="book_id"
+            )
+            print(f"✅ Created index for 'book_id' (required for deletion)")
+        except Exception as idx_error:
+            error_msg = str(idx_error).lower()
+            if "already exists" in error_msg or "duplicate" in error_msg:
+                print(f"ℹ️ Index for 'book_id' already exists")
+            else:
+                # If index creation fails for other reasons, log but continue
+                print(f"⚠️ Warning: Could not create index for 'book_id': {idx_error}")
+        
         print(f"🧹 Deleting Qdrant chunks for book_id={book_id}...")
         result = QDRANT_CLIENT.delete(
             collection_name=collection_name,
@@ -413,11 +644,22 @@ def delete_book_task(book_id: str, user_id: str):
     if not book:
         return {"status": "not_found"}
 
-    # If multiple users uploaded this book → only remove this user
-    if len(book.get("uploaded_by", [])) > 1:
+    uploaded_by = book.get("uploaded_by", {})
+    
+    # Handle migration: if uploaded_by is a list, convert to dict
+    if isinstance(uploaded_by, list):
+        uploaded_by = {uid: book.get("title", "Untitled") for uid in uploaded_by}
         books_collection.update_one(
             {"id": book_id},
-            {"$pull": {"uploaded_by": user_id}}
+            {"$set": {"uploaded_by": uploaded_by}}
+        )
+    
+    # If multiple users uploaded this book → only remove this user
+    if len(uploaded_by) > 1:
+        uploaded_by.pop(user_id, None)
+        books_collection.update_one(
+            {"id": book_id},
+            {"$set": {"uploaded_by": uploaded_by}}
         )
         print(f"👤 Removed user {user_id} from book {book_id}")
         return {"status": "user_removed_only", "book_id": book_id}
