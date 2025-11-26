@@ -70,10 +70,10 @@ async def rag_multiple_books_answer(
     query_vec = embedder.embed(request.prompt)[0].tolist()
     
     # ----------------------------
-    # Step 1: Search for similar chunks in specified books
+    # Step 1: Search for similar chunks in specified books using hybrid search
     # ----------------------------
     try:
-        search_task = search_similar_in_books_task.delay(query_vec, request.book_id, top_k)
+        search_task = search_similar_in_books_task.delay(query_vec, request.prompt, request.book_id, top_k)
         contexts = search_task.get(timeout=60)  # list of dicts
     except TimeoutError:
         raise HTTPException(status_code=504, detail="Search task timed out.")

@@ -13,6 +13,7 @@ from authlib.integrations.starlette_client import OAuth
 from starlette.requests import Request
 from dotenv import load_dotenv
 from database.mongo import users_collection
+from services.email_service import email_service
 # Load .env (if present)
 load_dotenv()
 
@@ -60,6 +61,17 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
+class Check2FARequest(BaseModel):
+    username: str
+
+class LoginWithPasswordRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginWith2FARequest(BaseModel):
+    username: str
+    two_factor_code: str
+
 # ==============================
 # Helper Functions
 # ==============================
@@ -99,13 +111,159 @@ async def signup(user: UserCreate):
     }
 
     await users_collection.insert_one(user_dict)
+    
+    # Send welcome email
+    try:
+        email_service.send_account_created_email(
+            user_email=user.email,
+            user_name=user.name,
+            username=user.username
+        )
+    except Exception as e:
+        print(f"⚠️ Failed to send welcome email: {e}")
+    
     return {"message": "User created successfully"}
 
+class Check2FARequest(BaseModel):
+    username: str
+
+class LoginWithPasswordRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginWith2FARequest(BaseModel):
+    username: str
+    two_factor_code: str
+
+@router.post("/check-2fa")
+async def check_2fa_status(request: Check2FARequest):
+    """
+    Check if 2FA is enabled for a username.
+    This endpoint is public and only checks if 2FA is enabled.
+    """
+    try:
+        user = await users_collection.find_one({"username": request.username})
+        if not user:
+            # Don't reveal if username exists or not for security
+            return {"username_exists": False, "two_factor_enabled": False}
+        
+        is_2fa_enabled = bool(user.get("two_factor_enabled") and user.get("two_factor_secret"))
+        return {
+            "username_exists": True,
+            "two_factor_enabled": is_2fa_enabled
+        }
+    except Exception as e:
+        # Handle MongoDB connection errors
+        error_msg = str(e)
+        if "ServerSelectionTimeoutError" in error_msg or "SSL handshake failed" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database connection failed. Please try again in a moment."
+            )
+        # Re-raise other exceptions
+        raise
+
 @router.post("/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = await users_collection.find_one({"username": form_data.username})
-    if not user or not verify_password(form_data.password, user["pass_hash"]):
+async def login(
+    login_data: LoginWithPasswordRequest,
+    request: Request = None
+):
+    """
+    Login endpoint for accounts without 2FA.
+    """
+    try:
+        user = await users_collection.find_one({"username": login_data.username})
+    except Exception as e:
+        # Handle MongoDB connection errors
+        error_msg = str(e)
+        if "ServerSelectionTimeoutError" in error_msg or "SSL handshake failed" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database connection failed. Please try again in a moment."
+            )
+        raise
+    
+    if not user or not verify_password(login_data.password, user["pass_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    # Check if 2FA is enabled - if so, user should use login-2fa endpoint
+    if user.get("two_factor_enabled") and user.get("two_factor_secret"):
+        raise HTTPException(
+            status_code=403,
+            detail="2FA_REQUIRED: Two-factor authentication is enabled. Please use /auth/login-2fa endpoint."
+        )
+
+    # Update last login
+    client_ip = request.client.host if request and request.client else None
+    
+    await users_collection.update_one(
+        {"id": user["id"]},
+        {"$set": {"last_login": datetime.utcnow()}}
+    )
+    
+    # Include username + role in token
+    token_data = {
+        "sub": user["username"],
+        "role": user["role"],
+        "id": user["id"],
+    }
+    access_token = create_access_token(token_data)
+    
+    # Send login notification email
+    try:
+        email_service.send_login_success_email(
+            user_email=user.get("email"),
+            user_name=user.get("name", user.get("username")),
+            login_time=datetime.utcnow(),
+            ip_address=client_ip
+        )
+    except Exception as e:
+        print(f"⚠️ Failed to send login email: {e}")
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@router.post("/login-2fa", response_model=Token)
+async def login_with_2fa(
+    login_data: LoginWith2FARequest,
+    request: Request = None
+):
+    """
+    Login endpoint for accounts with 2FA enabled.
+    This endpoint only requires username and 2FA code (password was verified in previous step).
+    """
+    try:
+        user = await users_collection.find_one({"username": login_data.username})
+    except Exception as e:
+        # Handle MongoDB connection errors
+        error_msg = str(e)
+        if "ServerSelectionTimeoutError" in error_msg or "SSL handshake failed" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database connection failed. Please try again in a moment."
+            )
+        raise
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username")
+
+    # Verify 2FA is enabled
+    if not user.get("two_factor_enabled") or not user.get("two_factor_secret"):
+        raise HTTPException(
+            status_code=400,
+            detail="2FA is not enabled for this account"
+        )
+    
+    if not login_data.two_factor_code:
+        raise HTTPException(
+            status_code=403,
+            detail="Two-factor authentication code is required"
+        )
+    
+    # Verify 2FA code
+    import pyotp
+    totp = pyotp.TOTP(user["two_factor_secret"])
+    if not totp.verify(login_data.two_factor_code, valid_window=1):
+        raise HTTPException(status_code=401, detail="Invalid 2FA code")
 
     # Include username + role in token
     token_data = {
@@ -114,6 +272,20 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         "id": user["id"],
     }
     access_token = create_access_token(token_data)
+    
+    # Send login notification email
+    try:
+        from datetime import datetime
+        client_ip = request.client.host if request and request.client else None
+        email_service.send_login_success_email(
+            user_email=user.get("email"),
+            user_name=user.get("name", user.get("username")),
+            login_time=datetime.utcnow(),
+            ip_address=client_ip
+        )
+    except Exception as e:
+        print(f"⚠️ Failed to send login email: {e}")
+    
     return {"access_token": access_token, "token_type": "bearer"}
 
 # ==============================

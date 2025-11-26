@@ -14,6 +14,7 @@ import hashlib
 from app.helpers import *
 from app.embedder import embedder
 from app.book_chunker import BookChunker
+from services.email_service import email_service
 
 # ------------------ Sub-tasks for PDF Processing (LOW PRIORITY - Background) ------------------ #
 
@@ -460,6 +461,42 @@ def process_pdf_pipeline_task(
     # Step 5: Update status
     update_book_status_task(book_info["book_id"], "complete")
     
+    # Step 6: Send email notification to all users who uploaded this book
+    try:
+        book = books_collection.find_one({"id": book_info["book_id"]})
+        if book:
+            uploaded_by = book.get("uploaded_by", {})
+            # Handle both dict and list formats
+            if isinstance(uploaded_by, list):
+                user_ids = uploaded_by
+            else:
+                user_ids = list(uploaded_by.keys())
+            
+            # Get book display name
+            book_display_name = book_info.get("title") or "Untitled"
+            
+            # Send email to each user
+            for user_id in user_ids:
+                try:
+                    user = users_collection.find_one({"id": user_id})
+                    if user and user.get("email"):
+                        # Get user's custom book name if available
+                        if isinstance(uploaded_by, dict):
+                            user_book_name = uploaded_by.get(user_id, book_display_name)
+                        else:
+                            user_book_name = book_display_name
+                        
+                        email_service.send_book_uploaded_email(
+                            user_email=user.get("email"),
+                            user_name=user.get("name", user.get("username", "User")),
+                            book_name=user_book_name,
+                            book_id=book_info["book_id"]
+                        )
+                except Exception as e:
+                    print(f"⚠️ Failed to send completion email to user {user_id}: {e}")
+    except Exception as e:
+        print(f"⚠️ Failed to send book completion emails: {e}")
+    
     print(f"✅ Completed background processing: {book_info['title']} by {book_info['author_name']}")
     return {
         "book_id": book_info["book_id"],
@@ -676,14 +713,16 @@ def delete_book_task(book_id: str, user_id: str):
 # ------------------ CHATBOT TASKS (HIGH PRIORITY) ------------------ #
 
 @celery_app.task(name="tasks.search_similar_in_books", queue='chatbot')
-def search_similar_in_books_task(query_vec, book_id: str, top_k: int = 3):
+def search_similar_in_books_task(query_vec, query_text: str, book_id: str, top_k: int = 3):
     """
-    HIGH PRIORITY: Search for similar content in books.
+    HIGH PRIORITY: Search for similar content in books using hybrid search.
+    Combines vector search (60%) and keyword search (40%).
     This task gets priority over PDF processing tasks.
     """
     all_results = []
     try:
-        all_results = search_similar_in_book(query_vec, book_id, top_k)
+        # Use hybrid search with 60% vector weight and 40% keyword weight
+        all_results = hybrid_search_in_book(query_vec, query_text, book_id, top_k, vector_weight=0.6, keyword_weight=0.4)
     except UnexpectedResponse as e:
         print(f"UnexpectedResponse: {e}")
     except Exception as e:

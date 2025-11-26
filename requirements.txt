@@ -15,6 +15,7 @@ python-dotenv==1.2.1
 python-jose[cryptography]==3.5.0
 qdrant-client==1.15.1
 qrcode[pil]==7.4.2
+reportlab==4.2.5
 sentence-transformers==5.1.2
 starlette>=0.40.0,<0.50.0
 redis

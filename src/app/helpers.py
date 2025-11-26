@@ -8,7 +8,9 @@ from sentence_transformers import SentenceTransformer
 import fitz
 from google import genai
 from google.genai.types import Content, Part
-from typing import List
+from typing import List, Dict
+import re
+from collections import Counter
 print("Initializing global clients for Celery worker...")
 
 # -------------------------------------------------------------------
@@ -259,8 +261,111 @@ def search_similar(query_vector, top_k=3):
     return [_format_context(hit) for hit in search_result.points]
 
 
+def _extract_keywords(query: str) -> List[str]:
+    """Extract meaningful keywords from a query string."""
+    # Remove punctuation and convert to lowercase
+    query_clean = re.sub(r'[^\w\s]', ' ', query.lower())
+    # Split into words and filter out common stop words
+    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'which', 'who', 'when', 'where', 'why', 'how'}
+    words = [w for w in query_clean.split() if len(w) > 2 and w not in stop_words]
+    return words
+
+
+def _calculate_keyword_score(content: str, keywords: List[str]) -> float:
+    """Calculate a keyword matching score for content based on keyword frequency."""
+    if not keywords or not content:
+        return 0.0
+    
+    content_lower = content.lower()
+    keyword_counts = Counter()
+    
+    # Count occurrences of each keyword in the content
+    for keyword in keywords:
+        # Count word boundaries to avoid partial matches
+        pattern = r'\b' + re.escape(keyword) + r'\b'
+        matches = len(re.findall(pattern, content_lower))
+        keyword_counts[keyword] = matches
+    
+    # Calculate score: sum of keyword frequencies, normalized
+    total_matches = sum(keyword_counts.values())
+    if total_matches == 0:
+        return 0.0
+    
+    # Normalize by content length and number of keywords
+    # Higher score for more keyword matches relative to content length
+    content_length = len(content.split())
+    if content_length == 0:
+        return 0.0
+    
+    # Score: (total matches / content length) * (unique keywords matched / total keywords)
+    unique_matched = len([k for k in keywords if keyword_counts[k] > 0])
+    frequency_score = total_matches / max(content_length, 1)
+    coverage_score = unique_matched / len(keywords) if keywords else 0
+    
+    # Combined score (weighted average)
+    score = (frequency_score * 0.6) + (coverage_score * 0.4)
+    return min(score, 1.0)  # Cap at 1.0
+
+
+def search_keywords_in_book(query_text: str, book_id: str, top_k: int = 3) -> List[Dict]:
+    """Search for chunks in a book using keyword matching (text search)."""
+    if not QDRANT_CLIENT.collection_exists(COLLECTION_NAME):
+        raise ValueError(f"Collection '{COLLECTION_NAME}' not found in Qdrant")
+
+    info = QDRANT_CLIENT.get_collection(COLLECTION_NAME)
+    if info.points_count == 0:
+        raise ValueError(f"Collection '{COLLECTION_NAME}' is empty")
+
+    # Extract keywords from query
+    keywords = _extract_keywords(query_text)
+    if not keywords:
+        return []
+
+    # Filter by book_id
+    filter_cond = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="book_id",
+                match=models.MatchAny(any=[book_id])
+            )
+        ]
+    )
+
+    # Scroll through all points matching the filter
+    all_chunks = []
+    next_page = None
+    
+    while True:
+        batch, next_page = QDRANT_CLIENT.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+            scroll_filter=filter_cond,
+            offset=next_page
+        )
+        
+        for point in batch:
+            payload = point.payload or {}
+            content = payload.get("content", "")
+            if content:
+                # Calculate keyword score
+                keyword_score = _calculate_keyword_score(content, keywords)
+                if keyword_score > 0:
+                    context = _format_context(point)
+                    context["score"] = keyword_score
+                    all_chunks.append(context)
+        
+        if not next_page:
+            break
+
+    # Sort by keyword score and return top-k
+    all_chunks.sort(key=lambda x: x.get("score", 0) or 0, reverse=True)
+    return all_chunks[:top_k]
+
+
 def search_similar_in_book(query_vector, book_id: str, top_k: int = 3):
-    """Search top-k similar chunks in a single book."""
+    """Search top-k similar chunks in a single book using vector search."""
     if not QDRANT_CLIENT.collection_exists(COLLECTION_NAME):
         raise ValueError(f"Collection '{COLLECTION_NAME}' not found in Qdrant")
 
@@ -289,6 +394,93 @@ def search_similar_in_book(query_vector, book_id: str, top_k: int = 3):
     )
 
     return [_format_context(hit) for hit in search_result.points]
+
+
+def hybrid_search_in_book(query_vector: List[float], query_text: str, book_id: str, top_k: int = 3, 
+                          vector_weight: float = 0.6, keyword_weight: float = 0.4) -> List[Dict]:
+    """
+    Perform hybrid search combining vector search (60%) and keyword search (40%).
+    
+    Args:
+        query_vector: Embedding vector for semantic search
+        query_text: Original query text for keyword search
+        book_id: Book ID to search within
+        top_k: Number of top results to return
+        vector_weight: Weight for vector search results (default 0.6)
+        keyword_weight: Weight for keyword search results (default 0.4)
+    
+    Returns:
+        List of context dictionaries with combined scores
+    """
+    # Perform both searches
+    vector_results = search_similar_in_book(query_vector, book_id, top_k * 2)  # Get more results for merging
+    keyword_results = search_keywords_in_book(query_text, book_id, top_k * 2)
+    
+    # Create a dictionary to store combined results by chunk ID
+    combined_results: Dict[str, Dict] = {}
+    
+    # Normalize vector scores (Qdrant returns cosine similarity, typically 0-1)
+    if vector_results:
+        vector_scores = [r.get("score", 0) or 0 for r in vector_results]
+        max_vector_score = max(vector_scores) if vector_scores else 1.0
+        min_vector_score = min(vector_scores) if vector_scores else 0.0
+        vector_range = max_vector_score - min_vector_score if max_vector_score > min_vector_score else 1.0
+        
+        for result in vector_results:
+            chunk_id = result.get("id")
+            if chunk_id:
+                # Normalize vector score to 0-1 range
+                raw_score = result.get("score", 0) or 0
+                normalized_score = (raw_score - min_vector_score) / vector_range if vector_range > 0 else 0.5
+                combined_results[chunk_id] = {
+                    **result,
+                    "vector_score": normalized_score,
+                    "keyword_score": 0.0
+                }
+    
+    # Normalize keyword scores (already 0-1 range from our function)
+    if keyword_results:
+        keyword_scores = [r.get("score", 0) or 0 for r in keyword_results]
+        max_keyword_score = max(keyword_scores) if keyword_scores else 1.0
+        min_keyword_score = min(keyword_scores) if keyword_scores else 0.0
+        keyword_range = max_keyword_score - min_keyword_score if max_keyword_score > min_keyword_score else 1.0
+        
+        for result in keyword_results:
+            chunk_id = result.get("id")
+            if chunk_id:
+                # Normalize keyword score to 0-1 range
+                raw_score = result.get("score", 0) or 0
+                normalized_score = (raw_score - min_keyword_score) / keyword_range if keyword_range > 0 else 0.5
+                
+                if chunk_id in combined_results:
+                    # Update existing result with keyword score
+                    combined_results[chunk_id]["keyword_score"] = normalized_score
+                else:
+                    # Add new result from keyword search
+                    combined_results[chunk_id] = {
+                        **result,
+                        "vector_score": 0.0,
+                        "keyword_score": normalized_score
+                    }
+    
+    # Calculate combined scores
+    final_results = []
+    for chunk_id, result in combined_results.items():
+        vector_score = result.get("vector_score", 0.0)
+        keyword_score = result.get("keyword_score", 0.0)
+        
+        # Combine scores with weights
+        combined_score = (vector_score * vector_weight) + (keyword_score * keyword_weight)
+        
+        result["score"] = combined_score
+        # Remove intermediate score fields
+        result.pop("vector_score", None)
+        result.pop("keyword_score", None)
+        final_results.append(result)
+    
+    # Sort by combined score and return top-k
+    final_results.sort(key=lambda x: x.get("score", 0) or 0, reverse=True)
+    return final_results[:top_k]
 
 
 def get_points_by_ids(ids: list):

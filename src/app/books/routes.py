@@ -1,11 +1,13 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, status, Form
 from celery_app.tasks import process_pdf_task, delete_book_task
-from database.auth import get_current_user
+from database.auth import get_current_user, users_collection
+from services.email_service import email_service
 import os
 import uuid
 import shutil
 from celery_app.celery_app import celery_app
 from celery.result import AsyncResult
+from database.mongo import books_collection
 router = APIRouter(prefix="/pdf", tags=["PDF Upload & Delete"])
 
 UPLOAD_DIR = "uploads"
@@ -38,6 +40,20 @@ async def upload_pdf(
         # Enqueue Celery background task with user_id and optional book_name
         task = process_pdf_task.delay(pdf_path=file_path, user_id=user_id)
 
+        # Send book upload email notification
+        try:
+            user = await users_collection.find_one({"id": user_id})
+            if user:
+                book_display_name = book_name or file.filename or "Untitled"
+                email_service.send_book_uploaded_email(
+                    user_email=user.get("email"),
+                    user_name=user.get("name", user.get("username", "User")),
+                    book_name=book_display_name,
+                    book_id="processing"  # Book ID not available yet
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to send book upload email: {e}")
+
         return {
             "message": "✅ File uploaded successfully. Processing started.",
             "task_id": task.id,
@@ -61,8 +77,30 @@ async def delete_pdf(book_id: str, current_user: dict = Depends(get_current_user
         user_id = str(current_user["id"])
         qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
 
+        # Get book info before deletion for email
+        book = await books_collection.find_one({"id": book_id})
+        book_name = "Unknown Book"
+        if book:
+            uploaded_by = book.get("uploaded_by", {})
+            if isinstance(uploaded_by, dict):
+                book_name = uploaded_by.get(user_id, book.get("title", "Unknown Book"))
+            else:
+                book_name = book.get("title", "Unknown Book")
+
         # Enqueue Celery deletion task
         task = delete_book_task.delay(book_id=book_id, user_id=user_id)
+
+        # Send book deletion email notification
+        try:
+            user = await users_collection.find_one({"id": user_id})
+            if user:
+                email_service.send_book_deleted_email(
+                    user_email=user.get("email"),
+                    user_name=user.get("name", user.get("username", "User")),
+                    book_name=book_name
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to send book deletion email: {e}")
 
         return {
             "message": "🧹 Deletion task started.",
