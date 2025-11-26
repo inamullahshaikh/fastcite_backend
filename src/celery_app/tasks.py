@@ -5,7 +5,7 @@ import concurrent.futures
 from typing import List, Dict
 from qdrant_client import models
 from celery_app.celery_app import celery_app
-from database.mongo import books_collections as books_collection
+from database.mongo import books_collections as books_collection, users_collections as users_collection
 from datetime import datetime
 from qdrant_client.http.exceptions import UnexpectedResponse
 import re
