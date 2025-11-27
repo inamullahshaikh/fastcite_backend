@@ -15,6 +15,7 @@ from app.helpers import *
 from app.embedder import embedder
 from app.book_chunker import BookChunker
 from services.email_service import email_service
+from app.rate_limiter import check_rate_limit, record_api_call
 
 # ------------------ Sub-tasks for PDF Processing (LOW PRIORITY - Background) ------------------ #
 
@@ -489,7 +490,7 @@ def process_pdf_pipeline_task(
                         email_service.send_book_uploaded_email(
                             user_email=user.get("email"),
                             user_name=user.get("name", user.get("username", "User")),
-                            book_name=user_book_name,
+                            book_name=book_info["title"],
                             book_id=book_info["book_id"]
                         )
                 except Exception as e:
@@ -732,12 +733,21 @@ def search_similar_in_books_task(query_vec, query_text: str, book_id: str, top_k
     return all_results
 
 
-@celery_app.task(name="tasks.select_top_contexts", queue='chatbot')
-def select_top_contexts_task(contexts: List[dict], user_query: str) -> List[str]:
+@celery_app.task(name="tasks.select_top_contexts", queue='chatbot', bind=True, max_retries=10)
+def select_top_contexts_task(self, contexts: List[dict], user_query: str) -> List[str]:
     """
     HIGH PRIORITY: Use Gemini to pick top 3 most relevant contexts.
     This task gets priority over PDF processing tasks.
+    Includes rate limiting to prevent exceeding 15 RPM limit.
     """
+    # Check rate limit before making API call
+    can_proceed, wait_seconds = check_rate_limit()
+    
+    if not can_proceed:
+        # Rate limit reached, retry after wait_seconds
+        print(f"⏸️ Rate limit reached in select_top_contexts_task. Retrying in {wait_seconds:.1f} seconds...")
+        raise self.retry(countdown=int(wait_seconds) + 1, exc=Exception(f"Rate limit reached. Retry in {wait_seconds:.1f}s"))
+    
     context_list = []
     for i, c in enumerate(contexts):
         context_id = c.get('id', f'unknown_{i}')
@@ -767,6 +777,9 @@ def select_top_contexts_task(contexts: List[dict], user_query: str) -> List[str]
                 Content(role="user", parts=[Part(text=selection_prompt)])
             ]
         )
+        # Record successful API call
+        record_api_call()
+        
         cleaned = re.sub(r"^```json\s*|```$", "", response.text.strip(), flags=re.MULTILINE).strip()
         parsed = json.loads(cleaned)
         selected_ids = parsed.get("selected_ids", [])
@@ -776,15 +789,28 @@ def select_top_contexts_task(contexts: List[dict], user_query: str) -> List[str]
         return selected_ids[:3] if len(selected_ids) >= 3 else selected_ids
     except Exception as e:
         print(f"Error selecting contexts: {e}")
+        # If it's a rate limit error from Gemini API, retry
+        if "429" in str(e) or "quota" in str(e).lower() or "rate limit" in str(e).lower():
+            print(f"⏸️ Gemini API rate limit error. Retrying...")
+            raise self.retry(countdown=60, exc=e)
         return [c.get('id') for c in contexts[:3]]
 
 
-@celery_app.task(name="tasks.call_model", queue='chatbot')
-def call_model_task(full_prompt: str, system_prompt: str) -> tuple[str, str]:
+@celery_app.task(name="tasks.call_model", queue='chatbot', bind=True, max_retries=10)
+def call_model_task(self, full_prompt: str, system_prompt: str) -> tuple[str, str]:
     """
     HIGH PRIORITY: Generate text using Gemini.
     This task gets priority over PDF processing tasks.
+    Includes rate limiting to prevent exceeding 15 RPM limit.
     """
+    # Check rate limit before making API call
+    can_proceed, wait_seconds = check_rate_limit()
+    
+    if not can_proceed:
+        # Rate limit reached, retry after wait_seconds
+        print(f"⏸️ Rate limit reached in call_model_task. Retrying in {wait_seconds:.1f} seconds...")
+        raise self.retry(countdown=int(wait_seconds) + 1, exc=Exception(f"Rate limit reached. Retry in {wait_seconds:.1f}s"))
+    
     try:
         response = client_genai.models.generate_content(
             model=AIMODEL,
@@ -793,11 +819,122 @@ def call_model_task(full_prompt: str, system_prompt: str) -> tuple[str, str]:
                 Content(role="user", parts=[Part(text=full_prompt)])
             ]
         )
+        # Record successful API call
+        record_api_call()
+        
         answer = response.text.strip()
         return answer, "No reasoning available (Gemini API does not return reasoning steps)"
     except Exception as e:
+        error_str = str(e)
         print(f"Error calling Gemini model: {e}")
-        return f"Error: {str(e)}", "No reasoning available"
+        
+        # If it's a rate limit error from Gemini API, retry
+        if "429" in error_str or "quota" in error_str.lower() or "rate limit" in error_str.lower():
+            print(f"⏸️ Gemini API rate limit error. Retrying in 60 seconds...")
+            raise self.retry(countdown=60, exc=e)
+        
+        return f"Error: {error_str}", "No reasoning available"
+
+
+def _needs_current_information(query: str) -> bool:
+    """
+    Detect if a question requires current/real-time information (date, time, current events, current leaders).
+    """
+    query_lower = query.lower().strip()
+    
+    # Questions about current date/time
+    date_time_patterns = [
+        r'what.*today.*date',
+        r'what.*current.*date',
+        r'what.*time.*it',
+        r'what.*time.*now',
+        r'what.*day.*today',
+        r'current.*date',
+        r'today.*date',
+        r'what.*date.*today',
+        r'what.*is.*today',
+        r'what.*day.*is.*it'
+    ]
+    if any(re.search(pattern, query_lower) for pattern in date_time_patterns):
+        return True
+    
+    # Questions about current leaders/positions
+    current_leader_patterns = [
+        r'who.*president.*(usa|united states|america|us)',
+        r'who.*prime minister.*(uk|britain|england|australia|canada|india)',
+        r'who.*current.*president',
+        r'who.*current.*leader',
+        r'current.*president',
+        r'current.*leader'
+    ]
+    if any(re.search(pattern, query_lower) for pattern in current_leader_patterns):
+        return True
+    
+    # Questions about current events (recent news, current year, etc.)
+    current_events_patterns = [
+        r'what.*current.*year',
+        r'what.*year.*is.*it',
+        r'current.*year',
+        r'recent.*news',
+        r'latest.*news',
+        r'current.*events'
+    ]
+    if any(re.search(pattern, query_lower) for pattern in current_events_patterns):
+        return True
+    
+    return False
+
+
+def _is_general_knowledge_question(query: str) -> bool:
+    """
+    Detect if a question is a general knowledge question that doesn't require document context.
+    
+    This should ONLY return True for questions that are clearly general knowledge:
+    - Greetings: "hello", "hi", "hey"
+    - Current date/time: "what is today's date?", "what time is it?"
+    - Very common general facts that are unlikely to be in academic books
+    
+    We should be conservative - if in doubt, treat as book-specific question.
+    """
+    query_lower = query.lower().strip()
+    
+    # Very short queries (1-2 words) - check if they're greetings
+    word_count = len(query_lower.split())
+    if word_count <= 2:
+        # Check if it's a greeting
+        greetings = ['hello', 'hi', 'hey', 'greetings', 'good morning', 'good afternoon', 'good evening', 'goodbye', 'bye']
+        if any(greeting in query_lower for greeting in greetings):
+            return True
+        # Single word queries that are clearly not book-related
+        if word_count == 1 and query_lower in ['hello', 'hi', 'hey', 'thanks', 'thank you']:
+            return True
+    
+    # Questions about current date/time - these are always general knowledge
+    date_time_patterns = [
+        r'what.*today.*date',
+        r'what.*current.*date',
+        r'what.*time.*it',
+        r'what.*time.*now',
+        r'what.*day.*today',
+        r'current.*date',
+        r'today.*date'
+    ]
+    if any(re.search(pattern, query_lower) for pattern in date_time_patterns):
+        return True
+    
+    # Very specific general knowledge questions that are unlikely to be in books
+    # These are questions about current events, common facts, etc.
+    general_only_patterns = [
+        r'what.*capital.*of.*(france|england|spain|germany|italy|japan|china|india|australia|canada|brazil|mexico)',
+        r'who.*president.*(usa|united states|america)',
+        r'what.*population.*of.*(world|earth)',
+        r'how.*many.*people.*(world|earth|planet)'
+    ]
+    if any(re.search(pattern, query_lower) for pattern in general_only_patterns):
+        return True
+    
+    # Default: treat as book-specific question (be conservative)
+    return False
 
 
 @celery_app.task(name="tasks.process_contexts_and_generate", queue='chatbot')
@@ -805,18 +942,98 @@ def process_contexts_and_generate_task(contexts: List[dict], user_query: str):
     """
     HIGH PRIORITY: Complete pipeline - select top contexts + generate answer.
     This task gets priority over PDF processing tasks.
+    
+    Now includes relevance filtering and conditional context usage.
+    Improved handling of general knowledge questions.
     """
     from celery_app.tasks import select_top_contexts_task, call_model_task
+    from app.helpers import filter_contexts_by_relevance
 
-    selection_contexts = contexts[:10]
-    selected_ids = select_top_contexts_task(contexts, user_query)
-    selected_contexts = [c for c in contexts if c.get('id') in selected_ids]
+    # Check if this is a general knowledge question
+    is_general_question = _is_general_knowledge_question(user_query)
+    
+    # Step 1: Filter contexts by relevance score
+    # For general questions, use a higher threshold to ensure contexts are truly relevant
+    # For book-specific questions, use the standard threshold
+    min_score = 0.7 if is_general_question else 0.3
+    filtered_contexts = filter_contexts_by_relevance(contexts, min_score=min_score)
+    
+    # Step 2: For general questions, skip context selection if scores are low
+    # Even if contexts pass the threshold, check if they're actually relevant
+    if is_general_question and filtered_contexts:
+        # Check if the top context has a really high score (>0.8)
+        # If not, it's likely not relevant to the general question
+        top_score = filtered_contexts[0].get('score', 0) if filtered_contexts else 0
+        if top_score < 0.8:
+            # Contexts are not highly relevant, treat as general question
+            filtered_contexts = []
+    elif not is_general_question:
+        # For book-specific questions, use contexts even if scores are moderate
+        # This ensures we use book content for questions like "what is blockchain"
+        pass
+    
+    # Step 3: Select top contexts from filtered results
+    if filtered_contexts and not is_general_question:
+        selection_contexts = filtered_contexts[:10]
+        selected_ids = select_top_contexts_task(selection_contexts, user_query)
+        selected_contexts = [c for c in selection_contexts if c.get('id') in selected_ids]
+    else:
+        # No relevant contexts found OR it's a general question
+        selected_contexts = []
+        selected_ids = []
 
-    context_text = "\n\n".join([f"### {c.get('heading','')}\n{c.get('content','')}" for c in selected_contexts])
-    full_prompt = f"Use the following context to answer the question.\n\n{context_text}\n\n**User Question:** {user_query}"
+    # Check if question needs current information (date, time, current events)
+    needs_current_info = _needs_current_information(user_query)
+    
+    # Get current date/time if needed
+    current_info = ""
+    if needs_current_info:
+        now = datetime.now()
+        current_date = now.strftime("%B %d, %Y")  # e.g., "January 15, 2025"
+        current_time = now.strftime("%I:%M %p")  # e.g., "02:30 PM"
+        current_day = now.strftime("%A")  # e.g., "Monday"
+        current_year = now.strftime("%Y")  # e.g., "2025"
+        
+        current_info = f"""
+**Current Information:**
+- Today's date: {current_date}
+- Current day: {current_day}
+- Current time: {current_time}
+- Current year: {current_year}
+
+Please use this current information to answer the question accurately. If the question asks about the current date, time, or year, use the information provided above."""
+
+    # Step 4: Build prompt conditionally based on whether we have relevant contexts
+    if selected_contexts and not is_general_question:
+        # Use contexts when available and relevant (and not a general question)
+        context_text = "\n\n".join([
+            f"### {c.get('heading','')}\n{c.get('content','')}" 
+            for c in selected_contexts
+        ])
+        full_prompt = f"""Use the following context from the documents to answer the question. If the context doesn't contain relevant information to answer the question, you may use your general knowledge instead.
+{current_info}
+Context:
+{context_text}
+
+**User Question:** {user_query}"""
+    else:
+        # No contexts OR it's a general question - use base knowledge
+        if is_general_question:
+            full_prompt = f"""Answer the following question using your general knowledge. This is a general knowledge question that does not require information from any documents.
+{current_info}
+**User Question:** {user_query}
+
+Provide a helpful, accurate answer based on your training data and the current information provided above (if applicable). Do not mention that you cannot find the information in documents."""
+        else:
+            full_prompt = f"""Answer the following question using your general knowledge. Do not reference any documents or source materials.
+{current_info}
+**User Question:** {user_query}"""
 
     system_prompt = (
-        "You are a knowledgeable AI assistant. Respond in clean Markdown with headings, bullet points, and summary."
+        "You are a knowledgeable AI assistant. Respond in clean Markdown with headings, bullet points, and summary. "
+        "For general knowledge questions (greetings, current date/time, general facts), answer directly from your knowledge. "
+        "When current date/time information is provided, use it to answer questions accurately. "
+        "Do not say you cannot answer or that information is not available - provide the best answer you can."
     )
 
     answer, reasoning = call_model_task(full_prompt, system_prompt)
@@ -825,4 +1042,5 @@ def process_contexts_and_generate_task(contexts: List[dict], user_query: str):
         "reasoning": reasoning,
         "selected_ids": selected_ids,
         "selected_contexts": selected_contexts,
+        "contexts_used": len(selected_contexts) > 0
     }

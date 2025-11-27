@@ -686,6 +686,185 @@ class EmailService:
         """
         
         return self._send_email(user_email, subject, html_body, text_body)
+    
+    def send_password_reset_code_email(self, user_email: str, user_name: str, reset_code: str):
+        """Send password reset code email."""
+        subject = "Password Reset Code 🔐"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2d3748; background-color: #f7fafc; padding: 20px; }}
+                .email-wrapper {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }}
+                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 50px 30px; text-align: center; position: relative; }}
+                .header::after {{ content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0.1) 100%); }}
+                .header h1 {{ font-size: 32px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.5px; }}
+                .header .icon {{ font-size: 48px; margin-bottom: 10px; }}
+                .content {{ padding: 40px 35px; background-color: #ffffff; }}
+                .greeting {{ font-size: 18px; color: #1a202c; margin-bottom: 20px; font-weight: 600; }}
+                .message {{ font-size: 16px; color: #4a5568; margin-bottom: 25px; line-height: 1.8; }}
+                .code-box {{ background: linear-gradient(135deg, #f0f4ff 0%, #e0e7ff 100%); border: 3px solid #667eea; padding: 30px; border-radius: 12px; margin: 30px 0; text-align: center; box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2); }}
+                .code-box .code-label {{ font-size: 14px; color: #667eea; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px; font-weight: 600; }}
+                .code-box .code-value {{ font-size: 42px; font-weight: 700; color: #4c1d95; letter-spacing: 8px; font-family: 'Courier New', monospace; }}
+                .security-alert {{ background: linear-gradient(135deg, #fff5e6 0%, #ffe6cc 100%); border-left: 4px solid #ff9800; padding: 20px; border-radius: 8px; margin: 30px 0; }}
+                .security-alert .alert-icon {{ font-size: 24px; margin-bottom: 10px; }}
+                .security-alert .alert-title {{ font-size: 16px; font-weight: 700; color: #e65100; margin-bottom: 8px; }}
+                .security-alert .alert-text {{ font-size: 14px; color: #bf360c; line-height: 1.6; }}
+                .info-box {{ background: #f7fafc; border: 1px solid #e2e8f0; padding: 20px; border-radius: 8px; margin: 25px 0; }}
+                .info-box .info-label {{ font-size: 12px; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }}
+                .info-box .info-value {{ font-size: 16px; color: #2d3748; font-weight: 600; }}
+                .footer {{ background-color: #f7fafc; padding: 25px 35px; text-align: center; border-top: 1px solid #e2e8f0; }}
+                .footer p {{ font-size: 12px; color: #a0aec0; margin: 5px 0; }}
+                .footer .brand {{ color: #667eea; font-weight: 600; }}
+            </style>
+        </head>
+        <body>
+            <div class="email-wrapper">
+                <div class="header">
+                    <div class="icon">🔐</div>
+                    <h1>Password Reset Code</h1>
+                    <p>Use this code to reset your password</p>
+                </div>
+                <div class="content">
+                    <div class="greeting">Hello {user_name},</div>
+                    <div class="message">
+                        You requested to reset your password. Use the code below to verify your identity and set a new password.
+                    </div>
+                    <div class="code-box">
+                        <div class="code-label">Your Reset Code</div>
+                        <div class="code-value">{reset_code}</div>
+                    </div>
+                    <div class="info-box">
+                        <div class="info-label">Code Expires In</div>
+                        <div class="info-value">10 minutes</div>
+                    </div>
+                    <div class="security-alert">
+                        <div class="alert-icon">⚠️</div>
+                        <div class="alert-title">Security Notice</div>
+                        <div class="alert-text">
+                            If you did not request this password reset, please ignore this email. Your account remains secure. Do not share this code with anyone.
+                        </div>
+                    </div>
+                    <div class="message">
+                        Enter this code in the password reset form to continue. The code will expire in 10 minutes for your security.
+                    </div>
+                </div>
+                <div class="footer">
+                    <p>Best regards,<br><span class="brand">The FastCite Team</span></p>
+                    <p style="margin-top: 15px;">This is an automated security email. Please do not reply to this message.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"""
+        Password Reset Code
+        
+        Hello {user_name},
+        
+        You requested to reset your password. Use the code below to verify your identity:
+        
+        Reset Code: {reset_code}
+        
+        This code will expire in 10 minutes.
+        
+        ⚠️ Security Notice: If you did not request this password reset, please ignore this email. Your account remains secure.
+        
+        Best regards,
+        The FastCite Team
+        """
+        
+        return self._send_email(user_email, subject, html_body, text_body)
+    
+    def send_signup_verification_code_email(self, user_email: str, user_name: str, verification_code: str):
+        """Send signup verification code email."""
+        subject = "Verify Your FastCite Account 🎉"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2d3748; background-color: #f7fafc; padding: 20px; }}
+                .email-wrapper {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }}
+                .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 50px 30px; text-align: center; position: relative; }}
+                .header::after {{ content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0.1) 100%); }}
+                .header h1 {{ font-size: 32px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.5px; }}
+                .header .icon {{ font-size: 48px; margin-bottom: 10px; }}
+                .content {{ padding: 40px 35px; background-color: #ffffff; }}
+                .greeting {{ font-size: 18px; color: #1a202c; margin-bottom: 20px; font-weight: 600; }}
+                .message {{ font-size: 16px; color: #4a5568; margin-bottom: 25px; line-height: 1.8; }}
+                .code-box {{ background: linear-gradient(135deg, #f0f4ff 0%, #e0e7ff 100%); border: 3px solid #667eea; padding: 30px; border-radius: 12px; margin: 30px 0; text-align: center; box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2); }}
+                .code-box .code-label {{ font-size: 14px; color: #667eea; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px; font-weight: 600; }}
+                .code-box .code-value {{ font-size: 42px; font-weight: 700; color: #4c1d95; letter-spacing: 8px; font-family: 'Courier New', monospace; }}
+                .info-box {{ background: #f7fafc; border: 1px solid #e2e8f0; padding: 20px; border-radius: 8px; margin: 25px 0; }}
+                .info-box .info-label {{ font-size: 12px; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }}
+                .info-box .info-value {{ font-size: 16px; color: #2d3748; font-weight: 600; }}
+                .footer {{ background-color: #f7fafc; padding: 25px 35px; text-align: center; border-top: 1px solid #e2e8f0; }}
+                .footer p {{ font-size: 12px; color: #a0aec0; margin: 5px 0; }}
+                .footer .brand {{ color: #667eea; font-weight: 600; }}
+            </style>
+        </head>
+        <body>
+            <div class="email-wrapper">
+                <div class="header">
+                    <div class="icon">🎉</div>
+                    <h1>Welcome to FastCite!</h1>
+                    <p>Verify your email to complete signup</p>
+                </div>
+                <div class="content">
+                    <div class="greeting">Hello {user_name},</div>
+                    <div class="message">
+                        Thank you for signing up for FastCite! To complete your registration, please verify your email address using the code below.
+                    </div>
+                    <div class="code-box">
+                        <div class="code-label">Your Verification Code</div>
+                        <div class="code-value">{verification_code}</div>
+                    </div>
+                    <div class="info-box">
+                        <div class="info-label">Code Expires In</div>
+                        <div class="info-value">10 minutes</div>
+                    </div>
+                    <div class="message">
+                        Enter this code in the signup form to verify your email and activate your account. The code will expire in 10 minutes for your security.
+                    </div>
+                </div>
+                <div class="footer">
+                    <p>Best regards,<br><span class="brand">The FastCite Team</span></p>
+                    <p style="margin-top: 15px;">This is an automated email. Please do not reply to this message.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"""
+        Welcome to FastCite!
+        
+        Hello {user_name},
+        
+        Thank you for signing up for FastCite! To complete your registration, please verify your email address.
+        
+        Verification Code: {verification_code}
+        
+        This code will expire in 10 minutes.
+        
+        Enter this code in the signup form to verify your email and activate your account.
+        
+        Best regards,
+        The FastCite Team
+        """
+        
+        return self._send_email(user_email, subject, html_body, text_body)
 
 
 # Global email service instance

@@ -219,8 +219,32 @@ except Exception as e:
     print(f"❌ Failed to initialize Qdrant client: {e}")
     QDRANT_CLIENT = None
 COLLECTION_NAME = "pdf_chunks"
-AIMODEL = "gemini-2.0-flash-lite"
+AIMODEL = "gemini-2.5-flash-lite"
 client_genai = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+
+
+def filter_contexts_by_relevance(contexts: List[Dict], min_score: float = 0.3) -> List[Dict]:
+    """
+    Filter contexts that are below relevance threshold.
+    
+    Args:
+        contexts: List of context dictionaries with 'score' field
+        min_score: Minimum similarity score (0.0 to 1.0). Default 0.3.
+    
+    Returns:
+        Filtered list of contexts that meet the relevance threshold
+    """
+    if not contexts:
+        return []
+    
+    # Filter by score threshold
+    relevant_contexts = [
+        ctx for ctx in contexts 
+        if ctx.get('score', 0) is not None and ctx.get('score', 0) >= min_score
+    ]
+    
+    # If no contexts meet threshold, return empty list
+    return relevant_contexts
 
 
 def _format_context(hit):

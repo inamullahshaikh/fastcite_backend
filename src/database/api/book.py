@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
-from typing import List
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import List, Optional
 from pydantic import BaseModel
 from database.auth import get_current_user
 from database.mongo import books_collection
@@ -30,24 +30,45 @@ async def get_all_books(current_user: dict = Depends(get_current_user)):
     return books
 
 # ----------------------------
-# GET MY BOOKS (self)
+# GET MY BOOKS (self) - with pagination
 # ----------------------------
-@router.get("/me", response_model=List[Book])
-async def get_my_books(current_user: dict = Depends(get_current_user)):
+class PaginatedBooksResponse(BaseModel):
+    books: List[Book]
+    total: int
+    page: int
+    limit: int
+    has_more: bool
+
+@router.get("/me", response_model=PaginatedBooksResponse)
+async def get_my_books(
+    current_user: dict = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page (max 100)")
+):
     user_id = str(current_user["id"])
+    
+    # Calculate skip
+    skip = (page - 1) * limit
     
     # Query books where user_id is a key in uploaded_by dict
     # This handles both old list format and new dict format
+    query = {
+        "$or": [
+            {f"uploaded_by.{user_id}": {"$exists": True}},  # New dict format
+            {"uploaded_by": user_id}  # Old list format (for migration)
+        ]
+    }
+    
+    # Get total count
+    total = await books_collection.count_documents(query)
+    
+    # Get paginated results, sorted by uploaded_at descending
     cursor = books_collection.find(
-        {
-            "$or": [
-                {f"uploaded_by.{user_id}": {"$exists": True}},  # New dict format
-                {"uploaded_by": user_id}  # Old list format (for migration)
-            ]
-        },
+        query,
         {"_id": 0}
-    )
-    raw_books = await cursor.to_list(length=1000)
+    ).sort("uploaded_at", -1).skip(skip).limit(limit)
+    
+    raw_books = await cursor.to_list(length=limit)
 
     books = []
     for b in raw_books:
@@ -93,7 +114,13 @@ async def get_my_books(current_user: dict = Depends(get_current_user)):
             )
         )
 
-    return books
+    return PaginatedBooksResponse(
+        books=books,
+        total=total,
+        page=page,
+        limit=limit,
+        has_more=(skip + limit) < total
+    )
 
 # ----------------------------
 # UPDATE BOOK (admin or uploader)
