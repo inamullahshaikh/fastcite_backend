@@ -2,7 +2,7 @@ import os
 import uuid
 import fitz
 import concurrent.futures
-from typing import List, Dict
+from typing import List, Dict, Optional
 from qdrant_client import models
 from celery_app.celery_app import celery_app
 from database.mongo import books_collections as books_collection, users_collections as users_collection
@@ -136,7 +136,7 @@ def create_toc_fingerprint(toc_tree: Dict) -> str:
 
 
 @celery_app.task(name="check_or_create_book_task", queue='uploads')
-def check_or_create_book_task(title: str, author_name: str, pages: int, user_id: str, user_book_name: str = None, toc_tree: Dict = None) -> Dict:
+def check_or_create_book_task(title: str, author_name: str, pages: int, user_id: str, user_book_name: str = None, toc_tree: Dict = None, pdf_filename: str = None) -> Dict:
     """
     Check if book exists or create new book entry.
     
@@ -147,7 +147,25 @@ def check_or_create_book_task(title: str, author_name: str, pages: int, user_id:
         user_id: ID of the user uploading
         user_book_name: User-provided book name (stored in uploaded_by dict)
         toc_tree: Table of contents tree
+        pdf_filename: Original PDF filename (used as fallback when title is missing)
     """
+    # Extract filename without extension if pdf_filename is provided
+    fallback_title = None
+    if pdf_filename:
+        import os
+        # Remove path and extension, keep just the filename
+        filename_without_ext = os.path.splitext(os.path.basename(pdf_filename))[0]
+        # Remove UUID prefix if present (format: uuid_filename.pdf)
+        if '_' in filename_without_ext:
+            parts = filename_without_ext.split('_', 1)
+            # Check if first part looks like UUID (36 chars with dashes)
+            if len(parts) > 1 and (len(parts[0]) == 36 or len(parts[0]) == 32):
+                fallback_title = parts[1]
+            else:
+                fallback_title = filename_without_ext
+        else:
+            fallback_title = filename_without_ext
+    
     # Ensure title is a string
     if not isinstance(title, str):
         title = str(title) if title else ""
@@ -157,11 +175,6 @@ def check_or_create_book_task(title: str, author_name: str, pages: int, user_id:
     if not isinstance(author_name, str):
         author_name = str(author_name) if author_name else ""
     author_name = author_name.strip()
-    
-    # Ensure user_book_name is a string
-    if not user_book_name or not isinstance(user_book_name, str):
-        user_book_name = str(user_book_name) if user_book_name else (title or "Untitled")
-    user_book_name = user_book_name.strip() if user_book_name else (title or "Untitled")
     
     # Determine if we have metadata to match by
     has_metadata = title and title.strip()
@@ -178,11 +191,19 @@ def check_or_create_book_task(title: str, author_name: str, pages: int, user_id:
         if toc_fingerprint:
             existing_book = books_collection.find_one({"toc_fingerprint": toc_fingerprint})
             print(f"🔍 Searching for book by TOC fingerprint (no metadata available)")
+            if existing_book:
+                print(f"✅ Found existing book by TOC fingerprint - will update uploaded_by with PDF filename")
         else:
             print(f"⚠️ No TOC available and no metadata - treating as new book")
     else:
         # No title and no TOC - treat as new book
         print(f"⚠️ No metadata and no TOC - treating as new book")
+    
+    # If no metadata and we have a fallback title (PDF filename), use it
+    # But only if we're creating a new book (not updating existing)
+    if not has_metadata and fallback_title and not existing_book:
+        title = fallback_title
+        print(f"📝 Using PDF filename as title: {title}")
     
     if existing_book:
         print(f"📚 Book already exists")
@@ -223,7 +244,12 @@ def check_or_create_book_task(title: str, author_name: str, pages: int, user_id:
             uploaded_by = {uid: existing_book.get("title", "Untitled") for uid in (uploaded_by if isinstance(uploaded_by, list) else [])}
         
         # Add or update user's book name
-        uploaded_by[user_id] = user_book_name or existing_book.get("title", "") or "Untitled"
+        # If no metadata, use PDF filename for this user's book name
+        if not has_metadata and fallback_title:
+            uploaded_by[user_id] = fallback_title
+            print(f"📝 Updating uploaded_by with PDF filename: {fallback_title}")
+        else:
+            uploaded_by[user_id] = user_book_name or existing_book.get("title", "") or (fallback_title if fallback_title else "Untitled")
         
         books_collection.update_one(
             {"id": book_id},
@@ -244,13 +270,23 @@ def check_or_create_book_task(title: str, author_name: str, pages: int, user_id:
         book_id = str(uuid.uuid4())
         
         # Create uploaded_by dict with user_id as key and user_book_name as value
-        uploaded_by = {
-            user_id: user_book_name or title or "Untitled"
-        }
+        # If no metadata, use PDF filename
+        if not has_metadata and fallback_title:
+            uploaded_by = {
+                user_id: fallback_title
+            }
+            # Also use filename as title for the book
+            if not title:
+                title = fallback_title
+                print(f"📝 Using PDF filename as book title: {title}")
+        else:
+            uploaded_by = {
+                user_id: user_book_name or title or fallback_title or "Untitled"
+            }
         
         new_book = {
             "id": book_id,
-            "title": title,  # PDF metadata title (can be empty)
+            "title": title,  # PDF metadata title or filename (if no metadata)
             "author_name": author_name,
             "pages": pages,
             "status": "processing",
@@ -474,7 +510,8 @@ def process_pdf_pipeline_task(
                 user_ids = list(uploaded_by.keys())
             
             # Get book display name
-            book_display_name = book_info.get("title") or "Untitled"
+                        # book_display_name should now have the filename if metadata was missing
+                book_display_name = book_info.get("title") or "Untitled"
             
             # Send email to each user
             for user_id in user_ids:
@@ -520,10 +557,20 @@ def process_pdf_task(pdf_path: str, user_id: str, batch_size: int = 50, workers:
         batch_size: Batch size for processing
         workers: Number of workers for parallel processing
     """
+    import os
     
     # Validate global clients
     if not all([embedder, QDRANT_CLIENT, B2_UPLOADER]):
         raise EnvironmentError("One or more global clients (Model, Qdrant, B2) are not initialized.")
+    
+    # Extract original filename from path for fallback title
+    pdf_filename = os.path.basename(pdf_path)
+    # Remove UUID prefix if present (format: uuid_filename.pdf)
+    if '_' in pdf_filename:
+        parts = pdf_filename.split('_', 1)
+        # Check if first part looks like UUID (36 chars with dashes or 32 chars without)
+        if len(parts) > 1 and (len(parts[0]) == 36 or len(parts[0]) == 32):
+            pdf_filename = parts[1]
     
     # Step 1: Initialize collection (quick operation)
     initialize_qdrant_collection_task()
@@ -555,13 +602,15 @@ def process_pdf_task(pdf_path: str, user_id: str, batch_size: int = 50, workers:
     
     # Step 3: Check or create book (quick database operation)
     # Pass user's book_name to be stored in uploaded_by dict
+    # Also pass pdf_filename as fallback when title is missing
     book_info = check_or_create_book_task(
         pdf_title,  # PDF metadata title (can be empty)
         metadata["author_name"],
         metadata["pages"],
         user_id,
         user_book_name,  # User-provided name (stored in uploaded_by)
-        toc_tree
+        toc_tree,
+        pdf_filename  # Original PDF filename for fallback
     )
     
     # If book already exists, return immediately
@@ -675,8 +724,14 @@ def delete_b2_pdfs_task(book_id: str):
 
 
 @celery_app.task(name="delete_book_task", queue='maintenance')
-def delete_book_task(book_id: str, user_id: str):
-    """Delete a book entry, with support for multi-user uploads."""
+def delete_book_task(book_id: str, user_id: Optional[str] = None):
+    """
+    Delete a book entry, with support for multi-user uploads.
+    
+    Args:
+        book_id: ID of the book to delete
+        user_id: ID of the user requesting deletion. If None, it's an admin deletion (always deletes completely).
+    """
     
     book = books_collection.find_one({"id": book_id})
     if not book:
@@ -692,7 +747,15 @@ def delete_book_task(book_id: str, user_id: str):
             {"$set": {"uploaded_by": uploaded_by}}
         )
     
-    # If multiple users uploaded this book → only remove this user
+    # Admin deletion: always delete completely, regardless of number of users
+    if user_id is None:
+        books_collection.delete_one({"id": book_id})
+        delete_qdrant_chunks_task.delay(book_id)
+        delete_b2_pdfs_task.delay(book_id)
+        print(f"🧹 Admin deleted book {book_id} completely")
+        return {"status": "fully_deleted_by_admin", "book_id": book_id}
+    
+    # Regular user deletion: only remove user if multiple users uploaded
     if len(uploaded_by) > 1:
         uploaded_by.pop(user_id, None)
         books_collection.update_one(
@@ -736,7 +799,7 @@ def search_similar_in_books_task(query_vec, query_text: str, book_id: str, top_k
 @celery_app.task(name="tasks.select_top_contexts", queue='chatbot', bind=True, max_retries=10)
 def select_top_contexts_task(self, contexts: List[dict], user_query: str) -> List[str]:
     """
-    HIGH PRIORITY: Use Gemini to pick top 3 most relevant contexts.
+    HIGH PRIORITY: Use Gemini to pick top 10 most relevant contexts from 20 results.
     This task gets priority over PDF processing tasks.
     Includes rate limiting to prevent exceeding 15 RPM limit.
     """
@@ -758,7 +821,7 @@ def select_top_contexts_task(self, contexts: List[dict], user_query: str) -> Lis
 
     selection_prompt = f"""
     You are given {len(contexts)} context passages and a user query.
-    Select the TOP 3 most relevant context passages.
+    Select the TOP 10 most relevant context passages that best help answer the user's question.
 
     USER QUERY: {user_query}
 
@@ -766,7 +829,7 @@ def select_top_contexts_task(self, contexts: List[dict], user_query: str) -> Lis
     {contexts_text}
 
     Respond with ONLY JSON:
-    {{"selected_ids": ["id1", "id2", "id3"]}}
+    {{"selected_ids": ["id1", "id2", "id3", "id4", "id5", "id6", "id7", "id8", "id9", "id10"]}}
     """
 
     try:
@@ -786,14 +849,14 @@ def select_top_contexts_task(self, contexts: List[dict], user_query: str) -> Lis
         print("-----------------selected ids-------------------------")
         print(selected_ids)
         print("-----------------selected ids-------------------------")
-        return selected_ids[:3] if len(selected_ids) >= 3 else selected_ids
+        return selected_ids[:10] if len(selected_ids) >= 10 else selected_ids
     except Exception as e:
         print(f"Error selecting contexts: {e}")
         # If it's a rate limit error from Gemini API, retry
         if "429" in str(e) or "quota" in str(e).lower() or "rate limit" in str(e).lower():
             print(f"⏸️ Gemini API rate limit error. Retrying...")
             raise self.retry(countdown=60, exc=e)
-        return [c.get('id') for c in contexts[:3]]
+        return [c.get('id') for c in contexts[:10]]
 
 
 @celery_app.task(name="tasks.call_model", queue='chatbot', bind=True, max_retries=10)
@@ -952,31 +1015,17 @@ def process_contexts_and_generate_task(contexts: List[dict], user_query: str):
     # Check if this is a general knowledge question
     is_general_question = _is_general_knowledge_question(user_query)
     
-    # Step 1: Filter contexts by relevance score
-    # For general questions, use a higher threshold to ensure contexts are truly relevant
-    # For book-specific questions, use the standard threshold
-    min_score = 0.7 if is_general_question else 0.3
-    filtered_contexts = filter_contexts_by_relevance(contexts, min_score=min_score)
-    
-    # Step 2: For general questions, skip context selection if scores are low
-    # Even if contexts pass the threshold, check if they're actually relevant
-    if is_general_question and filtered_contexts:
-        # Check if the top context has a really high score (>0.8)
-        # If not, it's likely not relevant to the general question
-        top_score = filtered_contexts[0].get('score', 0) if filtered_contexts else 0
-        if top_score < 0.8:
-            # Contexts are not highly relevant, treat as general question
-            filtered_contexts = []
-    elif not is_general_question:
-        # For book-specific questions, use contexts even if scores are moderate
-        # This ensures we use book content for questions like "what is blockchain"
-        pass
-    
-    # Step 3: Select top contexts from filtered results
-    if filtered_contexts and not is_general_question:
-        selection_contexts = filtered_contexts[:10]
-        selected_ids = select_top_contexts_task(selection_contexts, user_query)
-        selected_contexts = [c for c in selection_contexts if c.get('id') in selected_ids]
+    # Step 1: Select top 10 contexts from all 20 results using LLM
+    # Pass all 20 contexts directly to LLM for intelligent selection (no pre-filtering)
+    if contexts and not is_general_question:
+        # Pass all 20 contexts to LLM for selection (it will select 10 most relevant)
+        selected_ids = select_top_contexts_task(contexts, user_query)
+        # Filter to get the selected contexts
+        selected_contexts = [c for c in contexts if c.get('id') in selected_ids]
+        # Ensure we have exactly 10 contexts (or as many as available, up to 10)
+        if len(selected_contexts) > 10:
+            selected_contexts = selected_contexts[:10]
+            selected_ids = selected_ids[:10]
     else:
         # No relevant contexts found OR it's a general question
         selected_contexts = []

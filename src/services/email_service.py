@@ -577,6 +577,111 @@ class EmailService:
         
         return self._send_email(user_email, subject, html_body, text_body)
     
+    def send_book_deleted_by_admin_email(self, user_email: str, user_name: str, book_name: str):
+        """Send email notification when a book is deleted by an admin."""
+        subject = f"Book '{book_name}' Removed by Administrator 📚"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2d3748; background-color: #f7fafc; padding: 20px; }}
+                .email-wrapper {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }}
+                .header {{ background: linear-gradient(135deg, #dc2626 0%, #ef4444 100%); color: white; padding: 50px 30px; text-align: center; position: relative; }}
+                .header::after {{ content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0.1) 100%); }}
+                .header h1 {{ font-size: 32px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.5px; }}
+                .header .icon {{ font-size: 48px; margin-bottom: 10px; }}
+                .content {{ padding: 40px 35px; background-color: #ffffff; }}
+                .greeting {{ font-size: 18px; color: #1a202c; margin-bottom: 20px; font-weight: 600; }}
+                .message {{ font-size: 16px; color: #4a5568; margin-bottom: 25px; line-height: 1.8; }}
+                .book-card {{ background: linear-gradient(135deg, #fff5f5 0%, #ffe0e0 100%); border: 2px solid #dc2626; padding: 30px; border-radius: 12px; margin: 30px 0; box-shadow: 0 2px 8px rgba(220, 38, 38, 0.15); }}
+                .book-card .book-title {{ font-size: 24px; font-weight: 700; color: #c53030; margin-bottom: 15px; }}
+                .status-badge {{ display: inline-block; background: #dc2626; color: white; padding: 8px 16px; border-radius: 20px; font-size: 14px; font-weight: 600; margin-top: 10px; }}
+                .status-badge::before {{ content: '🔒 '; }}
+                .info-box {{ background: #f7fafc; border: 1px solid #e2e8f0; padding: 20px; border-radius: 8px; margin: 25px 0; }}
+                .info-box .info-label {{ font-size: 12px; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }}
+                .info-box .info-value {{ font-size: 16px; color: #2d3748; font-weight: 600; }}
+                .admin-alert {{ background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border-left: 4px solid #dc2626; padding: 20px; border-radius: 8px; margin: 30px 0; }}
+                .admin-alert .alert-icon {{ font-size: 24px; margin-bottom: 10px; }}
+                .admin-alert .alert-title {{ font-size: 16px; font-weight: 700; color: #991b1b; margin-bottom: 8px; }}
+                .admin-alert .alert-text {{ font-size: 14px; color: #7f1d1d; line-height: 1.6; }}
+                .button-container {{ text-align: center; margin: 35px 0; }}
+                .button {{ display: inline-block; padding: 16px 40px; background: linear-gradient(135deg, #dc2626 0%, #ef4444 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 16px; box-shadow: 0 4px 12px rgba(220, 38, 38, 0.4); transition: transform 0.2s; }}
+                .button:hover {{ transform: translateY(-2px); box-shadow: 0 6px 16px rgba(220, 38, 38, 0.5); }}
+                .footer {{ background-color: #f7fafc; padding: 25px 35px; text-align: center; border-top: 1px solid #e2e8f0; }}
+                .footer p {{ font-size: 12px; color: #a0aec0; margin: 5px 0; }}
+                .footer .brand {{ color: #dc2626; font-weight: 600; }}
+            </style>
+        </head>
+        <body>
+            <div class="email-wrapper">
+                <div class="header">
+                    <div class="icon">🔒</div>
+                    <h1>Book Removed by Administrator</h1>
+                    <p>Administrative action taken</p>
+                </div>
+                <div class="content">
+                    <div class="greeting">Hello {user_name},</div>
+                    <div class="message">
+                        We are writing to inform you that the book listed below has been removed from your FastCite account by a system administrator.
+                    </div>
+                    <div class="book-card">
+                        <div class="book-title">{book_name}</div>
+                        <div class="status-badge">Removed by Admin</div>
+                    </div>
+                    <div class="info-box">
+                        <div class="info-label">Removal Time</div>
+                        <div class="info-value">{datetime.utcnow().strftime("%B %d, %Y at %I:%M %p UTC")}</div>
+                    </div>
+                    <div class="message">
+                        All associated data, including document chunks, embeddings, and metadata, have been permanently removed from our systems.
+                    </div>
+                    <div class="admin-alert">
+                        <div class="alert-icon">⚠️</div>
+                        <div class="alert-title">Administrative Removal</div>
+                        <div class="alert-text">
+                            This book was removed by a FastCite administrator. This action may have been taken due to policy violations, content issues, or other administrative reasons. If you have questions about this removal, please contact our support team.
+                        </div>
+                    </div>
+                    <div class="button-container">
+                        <a href="{FRONTEND_URL}/manage" class="button">View My Books →</a>
+                    </div>
+                </div>
+                <div class="footer">
+                    <p>Best regards,<br><span class="brand">The FastCite Team</span></p>
+                    <p style="margin-top: 15px;">This is an automated email. Please do not reply to this message.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"""
+        Book Removed by Administrator
+        
+        Hello {user_name},
+        
+        We are writing to inform you that the book "{book_name}" has been removed from your account by a FastCite administrator.
+        
+        Status: Removed by Admin
+        Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
+        
+        All associated data, including chunks and embeddings, have been permanently removed.
+        
+        This book was removed by a system administrator. This action may have been taken due to policy violations, content issues, or other administrative reasons.
+        
+        If you have questions about this removal, please contact our support team.
+        
+        Best regards,
+        The FastCite Team
+        """
+        
+        return self._send_email(user_email, subject, html_body, text_body)
+    
     def send_login_success_email(self, user_email: str, user_name: str, login_time: datetime, ip_address: Optional[str] = None):
         """Send email notification on successful login."""
         subject = "New Login Detected 🔐"
@@ -859,6 +964,101 @@ class EmailService:
         This code will expire in 10 minutes.
         
         Enter this code in the signup form to verify your email and activate your account.
+        
+        Best regards,
+        The FastCite Team
+        """
+        
+        return self._send_email(user_email, subject, html_body, text_body)
+
+    def send_account_deletion_code_email(self, user_email: str, user_name: str, deletion_code: str):
+        """Send account deletion verification code email."""
+        subject = "Account Deletion Verification Code ⚠️"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2d3748; background-color: #f7fafc; padding: 20px; }}
+                .email-wrapper {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }}
+                .header {{ background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); color: white; padding: 50px 30px; text-align: center; position: relative; }}
+                .header::after {{ content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0.1) 100%); }}
+                .header h1 {{ font-size: 32px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.5px; }}
+                .header .icon {{ font-size: 48px; margin-bottom: 10px; }}
+                .content {{ padding: 40px 35px; background-color: #ffffff; }}
+                .greeting {{ font-size: 18px; color: #1a202c; margin-bottom: 20px; font-weight: 600; }}
+                .message {{ font-size: 16px; color: #4a5568; margin-bottom: 25px; line-height: 1.8; }}
+                .warning-box {{ background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border: 3px solid #ef4444; padding: 25px; border-radius: 12px; margin: 30px 0; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.2); }}
+                .warning-box .warning-title {{ font-size: 18px; color: #dc2626; font-weight: 700; margin-bottom: 10px; }}
+                .warning-box .warning-text {{ font-size: 14px; color: #991b1b; line-height: 1.6; }}
+                .code-box {{ background: linear-gradient(135deg, #f0f4ff 0%, #e0e7ff 100%); border: 3px solid #667eea; padding: 30px; border-radius: 12px; margin: 30px 0; text-align: center; box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2); }}
+                .code-box .code-label {{ font-size: 14px; color: #667eea; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px; font-weight: 600; }}
+                .code-box .code-value {{ font-size: 42px; font-weight: 700; color: #4c1d95; letter-spacing: 8px; font-family: 'Courier New', monospace; }}
+                .info-box {{ background: #f7fafc; border: 1px solid #e2e8f0; padding: 20px; border-radius: 8px; margin: 25px 0; }}
+                .info-box .info-label {{ font-size: 12px; color: #718096; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }}
+                .info-box .info-value {{ font-size: 16px; color: #2d3748; font-weight: 600; }}
+                .footer {{ background-color: #f7fafc; padding: 25px 35px; text-align: center; border-top: 1px solid #e2e8f0; }}
+                .footer p {{ font-size: 12px; color: #a0aec0; margin: 5px 0; }}
+                .footer .brand {{ color: #667eea; font-weight: 600; }}
+            </style>
+        </head>
+        <body>
+            <div class="email-wrapper">
+                <div class="header">
+                    <div class="icon">⚠️</div>
+                    <h1>Account Deletion Request</h1>
+                    <p>Verify your identity to proceed</p>
+                </div>
+                <div class="content">
+                    <div class="greeting">Hello {user_name},</div>
+                    <div class="message">
+                        We received a request to delete your FastCite account. To confirm this action, please use the verification code below.
+                    </div>
+                    <div class="warning-box">
+                        <div class="warning-title">⚠️ Important Warning</div>
+                        <div class="warning-text">
+                            This action is permanent and cannot be undone. All your data, including books, chat sessions, and account information, will be permanently deleted.
+                        </div>
+                    </div>
+                    <div class="code-box">
+                        <div class="code-label">Your Deletion Verification Code</div>
+                        <div class="code-value">{deletion_code}</div>
+                    </div>
+                    <div class="info-box">
+                        <div class="info-label">Code Expires In</div>
+                        <div class="info-value">10 minutes</div>
+                    </div>
+                    <div class="message">
+                        Enter this code in the account deletion form to proceed. If you did not request this, please ignore this email and your account will remain safe.
+                    </div>
+                </div>
+                <div class="footer">
+                    <p>Best regards,<br><span class="brand">The FastCite Team</span></p>
+                    <p style="margin-top: 15px;">This is an automated email. Please do not reply to this message.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_body = f"""
+        Account Deletion Request
+        
+        Hello {user_name},
+        
+        We received a request to delete your FastCite account. To confirm this action, please use the verification code below.
+        
+        ⚠️ Important Warning: This action is permanent and cannot be undone. All your data, including books, chat sessions, and account information, will be permanently deleted.
+        
+        Deletion Verification Code: {deletion_code}
+        
+        This code will expire in 10 minutes.
+        
+        Enter this code in the account deletion form to proceed. If you did not request this, please ignore this email and your account will remain safe.
         
         Best regards,
         The FastCite Team

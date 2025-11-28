@@ -65,7 +65,7 @@ async def rag_multiple_books_answer(
         if current_user["role"] != "admin" and str(chat_session["user_id"]) != str(current_user["id"]):
             raise HTTPException(status_code=403, detail="Access denied to this chat session")
 
-    top_k = 10
+    top_k = 20  # Get 20 results from Qdrant for LLM to select from
     # Embed the user prompt (convert to list for JSON serialization)
     query_vec = embedder.embed(request.prompt)[0].tolist()
     
@@ -74,7 +74,7 @@ async def rag_multiple_books_answer(
     # ----------------------------
     try:
         search_task = search_similar_in_books_task.delay(query_vec, request.prompt, request.book_id, top_k)
-        contexts = search_task.get(timeout=60)  # list of dicts
+        contexts = search_task.get(timeout=60)  # list of dicts (20 results)
     except TimeoutError:
         raise HTTPException(status_code=504, detail="Search task timed out.")
     except Exception as e:
@@ -129,7 +129,7 @@ async def rag_multiple_books_answer(
         for c in selected_contexts
     ])
 
-    # Context metadata provided to LLM (top-k)
+    # Context metadata for the 10 selected contexts (not all 20)
     all_contexts_info = [
         {
             "id": c.get('id'),
@@ -138,7 +138,7 @@ async def rag_multiple_books_answer(
             "heading": c.get('heading'),
             "score": c.get('score')
         }
-        for c in contexts[:top_k]
+        for c in selected_contexts  # Only the 10 selected contexts
     ]
 
     # ----------------------------

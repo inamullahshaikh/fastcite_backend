@@ -65,11 +65,12 @@ async def get_my_chats(
     # Get total count
     total = await chat_sessions_collection.count_documents({"user_id": user_id})
     
-    # Get paginated results, sorted by updated_at descending
+    # Get paginated results, sorted by created_at descending (newest first)
+    # This ensures new chats appear at the top of the sidebar
     cursor = chat_sessions_collection.find(
         {"user_id": user_id}, 
         {"_id": 0}
-    ).sort("updated_at", -1).skip(skip).limit(limit)
+    ).sort("created_at", -1).skip(skip).limit(limit)
     
     chats = await cursor.to_list(length=limit)
     
@@ -484,6 +485,28 @@ async def add_message(chat_id: str, message: ChatMessage, current_user: dict = D
 # ----------------------------
 # DELETE CHAT
 # ----------------------------
+@router.delete("/user/{user_id}/all")
+async def delete_all_user_chats(user_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Delete all chat sessions for a specific user.
+    Only the user themselves can delete their own chats (for account deletion).
+    """
+    # Verify user can only delete their own chats
+    if str(current_user["id"]) != user_id:
+        raise HTTPException(status_code=403, detail="You can only delete your own chats")
+    
+    try:
+        # Delete all chats for this user
+        result = await chat_sessions_collection.delete_many({"user_id": user_id})
+        
+        return {
+            "message": f"Deleted {result.deleted_count} chat sessions for user",
+            "deleted_count": result.deleted_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete user chats: {str(e)}")
+
+
 @router.delete("/{chat_id}")
 async def delete_chat(chat_id: str, current_user: dict = Depends(get_current_user)):
     chat = await chat_sessions_collection.find_one({"id": chat_id})

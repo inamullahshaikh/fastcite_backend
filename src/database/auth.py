@@ -85,6 +85,13 @@ class ResetPasswordRequest(BaseModel):
     reset_code: str
     new_password: str
 
+class RequestDeleteAccountCodeRequest(BaseModel):
+    username: str
+
+class VerifyDeleteAccountCodeRequest(BaseModel):
+    username: str
+    deletion_code: str
+
 class SignupRequest(BaseModel):
     username: str
     email: EmailStr
@@ -284,17 +291,6 @@ async def complete_signup(request: CompleteSignupRequest):
         print(f"⚠️ Failed to send welcome email: {e}")
     
     return {"message": "Account created successfully! You can now log in."}
-
-class Check2FARequest(BaseModel):
-    username: str
-
-class LoginWithPasswordRequest(BaseModel):
-    username: str
-    password: str
-
-class LoginWith2FARequest(BaseModel):
-    username: str
-    two_factor_code: str
 
 @router.post("/check-2fa")
 async def check_2fa_status(request: Check2FARequest):
@@ -619,7 +615,120 @@ async def reset_password(request: ResetPasswordRequest):
     return {"message": "Password reset successfully"}
 
 # ==============================
-# CURRENT USER DEPENDENCY
+# CURRENT USER DEPENDENCY (must be defined before routes that use it)
+# ==============================
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        role: str = payload.get("role")
+        user_id: str = payload.get("id")
+        if username is None or user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = await users_collection.find_one({"id": user_id})
+    if user is None:
+        raise credentials_exception
+
+    user["role"] = role
+    return user
+
+# ==============================
+# ACCOUNT DELETION VERIFICATION ROUTES
+# ==============================
+@router.post("/request-delete-account-code")
+async def request_delete_account_code(request: RequestDeleteAccountCodeRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Request an account deletion verification code. Sends a 6-digit code to the user's email.
+    Only the user themselves can request a deletion code.
+    """
+    # Verify user can only request code for their own account
+    if str(current_user["username"]) != request.username:
+        raise HTTPException(status_code=403, detail="You can only request deletion code for your own account")
+    
+    user = await users_collection.find_one({"username": request.username})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if user has an email (required for deletion verification)
+    if not user.get("email"):
+        raise HTTPException(
+            status_code=400,
+            detail="No email address associated with this account. Please contact support."
+        )
+    
+    # Generate 6-digit deletion code
+    deletion_code = str(random.randint(100000, 999999))
+    
+    # Store deletion code with expiration (10 minutes)
+    deletion_data = {
+        "deletion_code": deletion_code,
+        "deletion_code_expires": datetime.utcnow() + timedelta(minutes=10),
+        "deletion_code_used": False
+    }
+    
+    await users_collection.update_one(
+        {"id": user["id"]},
+        {"$set": deletion_data}
+    )
+    
+    # Send deletion code email
+    try:
+        email_service.send_account_deletion_code_email(
+            user_email=user.get("email"),
+            user_name=user.get("name", user.get("username", "User")),
+            deletion_code=deletion_code
+        )
+    except Exception as e:
+        print(f"⚠️ Failed to send account deletion code email: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to send deletion code. Please try again later."
+        )
+    
+    return {"message": "Deletion verification code sent to your email. Please check your inbox."}
+
+@router.post("/verify-delete-account-code")
+async def verify_delete_account_code(request: VerifyDeleteAccountCodeRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Verify the account deletion code.
+    Only the user themselves can verify their deletion code.
+    """
+    # Verify user can only verify code for their own account
+    if str(current_user["username"]) != request.username:
+        raise HTTPException(status_code=403, detail="You can only verify deletion code for your own account")
+    
+    user = await users_collection.find_one({"username": request.username})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    stored_code = user.get("deletion_code")
+    code_expires = user.get("deletion_code_expires")
+    code_used = user.get("deletion_code_used", False)
+    
+    if not stored_code:
+        raise HTTPException(status_code=400, detail="No deletion code found. Please request a new one.")
+    
+    if code_used:
+        raise HTTPException(status_code=400, detail="Deletion code has already been used. Please request a new one.")
+    
+    if code_expires and datetime.utcnow() > code_expires:
+        raise HTTPException(status_code=400, detail="Deletion code has expired. Please request a new one.")
+    
+    if stored_code != request.deletion_code:
+        raise HTTPException(status_code=401, detail="Invalid deletion code")
+    
+    return {"message": "Deletion code verified successfully", "verified": True}
+
+# ==============================
+# CURRENT USER DEPENDENCY (must be defined before routes that use it)
 # ==============================
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -642,6 +751,18 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
     user["role"] = role
     return user
+
+# ==============================
+# ADMIN DEPENDENCY
+# ==============================
+async def get_admin_user(current_user: dict = Depends(get_current_user)):
+    """Dependency to ensure the current user is an admin."""
+    if str(current_user.get("role")) != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    return current_user
 
 # ==============================
 # GOOGLE OAUTH SETUP

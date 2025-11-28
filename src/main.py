@@ -9,6 +9,7 @@ from database.auth import router as auth_router
 from database.api.user import router as user_router
 from database.api.chat import router as chat_router
 from database.api.book import router as book_router
+from database.api.admin import router as admin_router
 from app.books.routes import router as app_book_router
 from app.rag.routes import router as rag_router
 from fastapi.staticfiles import StaticFiles
@@ -44,6 +45,7 @@ app.include_router(auth_router)
 app.include_router(user_router)
 app.include_router(chat_router)
 app.include_router(book_router)
+app.include_router(admin_router)  # Admin routes (requires admin role)
 app.include_router(app_book_router)
 app.include_router(rag_router)
 # ✅ Root endpoint

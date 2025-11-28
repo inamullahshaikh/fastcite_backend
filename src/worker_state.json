@@ -1,0 +1,11 @@
+{
+  "workers": {
+    "chatbot_1": {
+      "pid": 3080,
+      "queue": "chatbot",
+      "worker_id": 1,
+      "name": "chatbot_worker_1@%h",
+      "start_time": 1764309397.572176
+    }
+  }
+}
